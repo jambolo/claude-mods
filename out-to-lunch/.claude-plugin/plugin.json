@@ -1,0 +1,7 @@
+{
+  "name": "out-to-lunch",
+  "version": "0.1.0",
+  "author": { "name": "John Bolton" },
+  "description": "Shows what Claude is doing right now and why it is taking long: API wait, thinking, a slow tool, a permission prompt, subagents, compaction.",
+  "types": "./types/index.d.ts"
+}

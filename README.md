@@ -4,6 +4,7 @@ Mods for [Claude Code](https://claude.com/claude-code), published as a plugin ma
 
 | Mod | What it does |
 | --- | --- |
+| [out-to-lunch](out-to-lunch) | Shows what Claude is doing right now and why it is taking long. |
 
 ## Install
 
