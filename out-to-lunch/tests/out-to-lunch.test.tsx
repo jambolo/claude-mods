@@ -1,4 +1,4 @@
-import type { On } from 'claude-code'
+import type { On, UiPane } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
@@ -105,13 +105,17 @@ test('/out-to-lunch reports the live activity mid-turn and a summary after', () 
   expect(report(l, 60_000)).toContain('Slowest: Fetching example.com (50s)')
 })
 
-test('/out-to-lunch off hides the band and on shows it again', async ($, on) => {
+test('the band starts off, /out-to-lunch on shows it and off hides it again', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   drawEngineBand(on)
 
   await $.turn.start({ text: 'go', turnId: 't1' })
   await clock.advance(5_000)
+  expect(await isBandShown($)).toBe(false)
+
+  await runCommand($, 'on')
+  expect(await isBandShown($)).toBe(true)
 
   await runCommand($, 'off')
   const ui = await $.ui.mount({ plugin: 'out-to-lunch', surface: 'terminal', ...band(true) })
@@ -143,6 +147,32 @@ test('/out-to-lunch on <seconds> holds the band back until the turn has run that
   expect(JSON.stringify(await runCommand($, 'on soon'))).toContain('Usage')
 })
 
+test('the band stays hidden while the pane is open, past the delay too', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000 })
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  drawEngineBand(on)
+  // Stands for the engine's pane record.
+  let panes: UiPane[] = []
+  on('ui.open', ($, e) => {
+    panes = [{ id: e.id, title: e.title ?? e.id, isShown: true, isFocused: false, isPlaced: true }]
+    return { value: { isPlaced: true } }
+  })
+  on('ui.panes', () => ({ value: panes }))
+
+  await runCommand($, 'pane')
+  expect(JSON.stringify(await runCommand($, 'on 20'))).toContain('stays hidden while the pane is open')
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await clock.advance(25_000)
+  expect(await isBandShown($)).toBe(false)
+
+  panes = []
+  expect(await isBandShown($)).toBe(true)
+
+  await runCommand($, 'on')
+  await runCommand($, 'pane')
+  expect(await isBandShown($)).toBe(false)
+})
+
 test('the band shows the running tool and its elapsed time', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000 })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
@@ -151,6 +181,7 @@ test('the band shows the running tool and its elapsed time', async ($, on) => {
     return { result: {} }
   })
 
+  await runCommand($, 'on')
   await $.turn.start({ text: 'run the tests', turnId: 't1' })
   const running = $.tool.call({ tool: 'Bash', command: 'npm test' })
   await clock.advance(75_000)

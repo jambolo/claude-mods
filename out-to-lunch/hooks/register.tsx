@@ -29,7 +29,7 @@ const PANE = 'out-to-lunch'
 const TITLE = 'Why so slow?'
 const live = atom({ plugin: 'out-to-lunch', key: 'live' } as const, EMPTY)
 const dismissed = atom({ plugin: 'out-to-lunch', key: 'dismissed' } as const, null)
-const isHidden = atom({ plugin: 'out-to-lunch', key: 'isHidden' } as const, false)
+const isHidden = atom({ plugin: 'out-to-lunch', key: 'isHidden' } as const, true)
 const delaySeconds = atom({ plugin: 'out-to-lunch', key: 'delaySeconds' } as const, 0)
 const USAGE = 'Usage: `/out-to-lunch [pane | off | on [seconds]]`'
 // The summary of a finished turn shows only for turns at least this long.
@@ -88,8 +88,19 @@ function measure(chunk: TurnStepChunk): { kind: JobKind; chars: number; tool?: s
   }
 }
 
-function openPane($: EngineInterface) {
-  return $.ui.open({ id: PANE, title: TITLE })
+async function openPane($: EngineInterface) {
+  const opened = await $.ui.open({ id: PANE, title: TITLE })
+  // The band reads the engine's pane list, which no $.state write announces.
+  $.ui.invalidate('ui.render')
+  return opened
+}
+
+async function isPaneShown($: EngineInterface): Promise<boolean> {
+  try {
+    return (await $.ui.panes()).some(p => p.id === PANE && p.isShown && p.isPlaced)
+  } catch {
+    return false
+  }
 }
 
 export const register: Register = on => {
@@ -118,8 +129,9 @@ export const register: Register = on => {
       const delay = Number(turnOn[1] ?? 0)
       await update($, isHidden, () => false)
       await update($, delaySeconds, () => delay)
+      const text = delay > 0 ? `Band shown once a turn has run ${fmt(delay * 1000)}.` : 'Band shown.'
 
-      return { text: delay > 0 ? `Band shown once a turn has run ${fmt(delay * 1000)}.` : 'Band shown.' }
+      return { text: (await isPaneShown($)) ? `${text} It stays hidden while the pane is open.` : text }
     }
 
     if (arg !== '' && arg !== 'pane') return { text: USAGE }
@@ -131,6 +143,12 @@ export const register: Register = on => {
 
     return { text: opened.isPlaced ? text : `${text}\n\n(Pane not shown: ${opened.reason})` }
   })
+
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    const closed = await next(e)
+    $.ui.invalidate('ui.render')
+    return closed
+  }).catch(($, e, next) => next(e))
 
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') {
@@ -277,7 +295,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || (await read($, isHidden))) return next(e)
+    if (e.props.hasSurvey || (await read($, isHidden)) || (await isPaneShown($))) return next(e)
 
     const l = await read($, live)
     const t = l.turn
