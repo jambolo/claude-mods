@@ -1,0 +1,3 @@
+# Claude Code's local files stay out of git; shared rules are tracked.
+.claude/*
+!.claude/rules/
