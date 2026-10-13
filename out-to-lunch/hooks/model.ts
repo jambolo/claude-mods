@@ -356,8 +356,34 @@ export function diagnose(l: Live, now: number): Diagnosis {
   return { headline, since, tone, reasons }
 }
 
+/** Names one stretch of waiting: the turn and the moment its current phase began. */
+export function delayKey(t: Turn, d: Diagnosis): string {
+  return `${t.id}:${d.since}`
+}
+
+/** What the model is told about the current delay: the measurements, then Claude's latest output. */
+export function briefing(l: Live, now: number, d: Diagnosis, output: string): string {
+  const lines = [`Current delay: ${d.headline}, for ${fmt(now - d.since)}.`, ...d.reasons.map(r => `Measured hint: ${r}`)]
+  const t = l.turn
+  if (t) {
+    lines.push(`Turn so far: ${fmt(now - t.startedAt)}, ${t.steps} model steps, ${t.tools} tool calls; time went to ${shares(t, now, 4)}.`)
+    if (t.usage) {
+      const input = t.usage.input + t.usage.cacheRead + t.usage.cacheWrite
+      lines.push(`Last request: ~${Math.round(input / 1000)}k input tokens, ${Math.round(t.usage.cacheRead / 1000)}k from cache.`)
+    }
+    const done = l.log.filter(x => x.at >= t.startedAt).slice(-12)
+    if (done.length > 0) lines.push('Finished this turn, oldest first:', ...done.map(x => `- ${x.label}: ${fmt(x.ms)}`))
+  }
+  if (l.jobs.length > 0) {
+    lines.push('In flight:', ...l.jobs.map(j => `- ${j.label}${j.agentId ? ' (subagent)' : ''}: ${j.kind}, ${fmt(now - j.startedAt)}`))
+  }
+  if (l.mode) lines.push(`Permission mode: ${l.mode}.`)
+  lines.push('', "Claude's latest output, newest last, possibly cut at the start:", '<output>', output.trim() || '(none yet)', '</output>')
+  return lines.join('\n')
+}
+
 /** The `/out-to-lunch` answer, as markdown. */
-export function report(l: Live, now: number): string {
+export function report(l: Live, now: number, guess?: string): string {
   const t = l.turn
   if (t === null) return 'Nothing has run yet.'
   if (t.endedAt !== undefined) {
@@ -368,6 +394,7 @@ export function report(l: Live, now: number): string {
   return [
     `**${d.headline}** · ${fmt(now - d.since)}`,
     '',
+    ...(guess === undefined ? [] : [`- Likely (AI): ${guess}`]),
     ...d.reasons.map(r => `- ${r}`),
     '',
     `Turn ${fmt(now - t.startedAt)} · step ${t.steps} · ${t.tools} tool calls · ${shares(t, now, 4)}`,

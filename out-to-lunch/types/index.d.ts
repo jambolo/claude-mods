@@ -71,8 +71,18 @@ export type Live = {
   log: Done[]
 }
 
+/** The model's guess at why the delay named by `key` (see `delayKey`) is taking long. */
+export type Insight = { key: string; text: string }
+
 declare module 'claude-code' {
   interface PluginState {
-    'out-to-lunch': { live: Live; dismissed: string | null; isHidden: boolean; delaySeconds: number }
+    'out-to-lunch': {
+      live: Live
+      dismissed: string | null
+      isHidden: boolean
+      delaySeconds: number
+      isGuessing: boolean
+      insight: Insight | null
+    }
   }
 }

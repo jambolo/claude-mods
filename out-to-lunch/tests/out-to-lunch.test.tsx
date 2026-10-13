@@ -2,7 +2,7 @@ import type { On, UiPane } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { EMPTY, addJob, breakdown, diagnose, endJob, endTurn, patchJob, report, settle, startTurn } from '../hooks/model'
+import { EMPTY, addJob, breakdown, briefing, diagnose, endJob, endTurn, patchJob, report, settle, startTurn } from '../hooks/model'
 import type { Live } from '../types'
 
 const band = (isWorking: boolean) => ({
@@ -196,4 +196,68 @@ test('the band shows the running tool and its elapsed time', async ($, on) => {
 
   await clock.advance(15_000)
   await running
+})
+
+test('the briefing carries the measurements and the output tail', () => {
+  let l = startTurn(EMPTY, 't', 0)
+  l = step(l, 1_000, x => addJob(x, { id: 'tool:1', kind: 'tool', tool: 'Grep', label: 'Grep: TODO in C:/' }, 1_000))
+  const text = briefing(l, 40_000, diagnose(l, 40_000), '[thinking]\nSearching the whole drive for TODO.')
+  expect(text).toContain('Current delay: Grep: TODO in C:/, for 39s.')
+  expect(text).toContain('Grep: TODO in C:/: tool, 39s')
+  expect(text).toContain('<output>\n[thinking]\nSearching the whole drive for TODO.\n</output>')
+})
+
+// A running turn with one slow Bash call after the given commands, the model mocked; returns the prompts the mod sent.
+async function slowTurn($: Engine, on: On, commands: string[]) {
+  const clock = mock.clock(on, { now: 1_000 })
+  const prompts: string[] = []
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('model.complete', ($, e) => {
+    prompts.push(String(e.prompt))
+    const usage = { input_tokens: 900, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    return { value: { isAnswered: true as const, text: 'The npm test suite\n is slow.', usage } }
+  })
+  on('tool.call', async () => {
+    await clock.sleep(60_000)
+    return { result: {} }
+  })
+
+  await $.session.start({ cwd: 'C:/repo', surface: 'terminal', isInteractive: true })
+  for (const args of commands) await runCommand($, args)
+  await $.turn.start({ text: 'run the tests', turnId: 't1' })
+  const running = $.tool.call({ tool: 'Bash', command: 'npm test' })
+  await clock.advance(30_000)
+  return { prompts, finish: async () => (await clock.advance(30_000), await running) }
+}
+
+test('/out-to-lunch best-guess on warns that it uses tokens', async $ => {
+  expect(JSON.stringify(await runCommand($, 'best-guess on'))).toContain('Warning: this uses tokens')
+  expect(JSON.stringify(await runCommand($, 'best-guess'))).toContain('Best guess is on')
+  expect(JSON.stringify(await runCommand($, 'best-guess off'))).toContain('Best guess off')
+})
+
+test('with best guess on, a delay past 20s gets one AI guess, shown in the band and the report', async ($, on) => {
+  const turn = await slowTurn($, on, ['on', 'best-guess on'])
+  expect(turn.prompts.length).toBe(1)
+  expect(turn.prompts[0]).toContain('Bash: npm test')
+
+  const ui = await $.ui.mount({ plugin: 'out-to-lunch', surface: 'terminal', ...band(true) })
+  expect(await ui.find({ type: 'Text', text: /Likely: The npm test suite is slow\./ })).toBeDefined()
+  await ui.unmount()
+  expect(JSON.stringify(await runCommand($, ''))).toContain('Likely (AI): The npm test suite is slow.')
+  await turn.finish()
+})
+
+test('best guess is off by default', async ($, on) => {
+  const turn = await slowTurn($, on, ['on'])
+  expect(turn.prompts.length).toBe(0)
+  await turn.finish()
+})
+
+test('no AI guess is asked for while nothing can show it', async ($, on) => {
+  const turn = await slowTurn($, on, ['best-guess on'])
+  expect(turn.prompts.length).toBe(0)
+  await turn.finish()
 })

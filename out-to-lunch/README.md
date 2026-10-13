@@ -16,6 +16,7 @@ Once you turn it on with `/out-to-lunch on`, a band above the prompt shows, whil
 
 - what Claude is doing and for how long: waiting for the API, thinking, writing, preparing a tool call, running a tool, a permission check or prompt, subagents, compacting;
 - the likely reasons it is slow: no first token yet (API busy, rate-limited or retrying), a large context or a prompt-cache miss, high effort, a build or test command, a network or MCP call, many round trips;
+- with `/out-to-lunch best-guess on`, once one phase has lasted 20 seconds, the most likely cause in one sentence, guessed by Claude Haiku from those measurements and Claude's latest output (this uses tokens: see Limits);
 - the turn's elapsed time, step, tool calls, and where the time went so far.
 
 After a turn of 30 seconds or more, the band shows one line on where its time went, until you dismiss it with `x`.
@@ -31,9 +32,12 @@ The band stays hidden while the pane is open and comes back when you close it.
 | `/out-to-lunch off` | Hides the band for this session. `/out-to-lunch` and the pane keep working. |
 | `/out-to-lunch on` | Shows the band for this session, from the start of each turn, whenever the pane is closed. Every new session starts with it off. |
 | `/out-to-lunch on <seconds>` | Shows the band only once a turn has run that long (`/out-to-lunch on 20`), and the last-turn summary only for turns at least that long. For this session. |
+| `/out-to-lunch best-guess on` | **Uses tokens.** Adds an AI guess at the most likely cause of each delay over 20 seconds to the band, the pane and `/out-to-lunch`. For this session; every new session starts with it off. |
+| `/out-to-lunch best-guess off` | Stops the AI guesses. `/out-to-lunch best-guess` alone says whether it is on. |
 
 ## Limits
 
 - Reasons are inferred from events and timing, not measured inside the API or a running command.
 - No event marks when you answer a permission prompt, so a tool's run after you approve it counts as permission-prompt time.
 - Context and cache reasons use the previous request's token usage.
+- **`best-guess` uses tokens.** While it is on, each delay over 20 seconds sends one request to Claude Haiku (about 1–2k input tokens, at most 150 output), billed like any other usage, but only while the band or pane is showing. With it off, the default, the mod makes no model requests. The answer is a guess.
