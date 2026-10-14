@@ -1,0 +1,7 @@
+{
+  "name": "change-of-subject",
+  "version": "1.0.0",
+  "author": { "name": "John Bolton" },
+  "description": "Judges every prompt against the session it was typed into: offers /btw for one that belongs to another subject, and a fresh session or a compaction for one that starts a new phase.",
+  "types": "./types/index.d.ts"
+}

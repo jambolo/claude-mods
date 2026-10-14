@@ -5,6 +5,7 @@ Mods for [Claude Code](https://claude.com/claude-code), published as a plugin ma
 | Mod | What it does |
 | --- | --- |
 | [out-to-lunch](out-to-lunch) | Shows what Claude is doing right now and why it is taking long. |
+| [change-of-subject](change-of-subject) | Judges each prompt against the session: offers `/btw` for an aside, a fresh session or a compaction for a new phase. |
 
 ## Install
 

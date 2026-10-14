@@ -2,5 +2,8 @@
   "name": "claude-mods",
   "description": "Mods for Claude Code.",
   "owner": { "name": "John Bolton" },
-  "plugins": [{ "name": "out-to-lunch", "source": "./out-to-lunch" }]
+  "plugins": [
+    { "name": "out-to-lunch", "source": "./out-to-lunch" },
+    { "name": "change-of-subject", "source": "./change-of-subject" }
+  ]
 }
