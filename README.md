@@ -27,11 +27,11 @@ The mods need a Claude Code build with function hooks (built against 2.1.295). T
 <mod>/                            one folder per mod
   .claude-plugin/plugin.json      name, version, description, author
   hooks/hooks.json                names the hooks module
-  hooks/register.tsx              the hooks module
+  hooks/register.ts(x)            the hooks module
   types/index.d.ts                the mod's $.state contract, if it keeps state
   tests/*.test.ts                 run by claude plugin test
   README.md                       what the mod does and how to use it
-scripts/check.ps1                 validates and tests every mod
+scripts/check.sh                  validates and tests every mod
 ```
 
 `<mod>/.claude-plugin/types/` is written by Claude Code when it loads a mod and is ignored by git.
@@ -41,17 +41,17 @@ scripts/check.ps1                 validates and tests every mod
 1. Create `<mod>/` with the files above. The folder name, the `name` in `plugin.json` and the marketplace entry's `name` are the same.
 2. Add `{ "name": "<mod>", "source": "./<mod>" }` to `plugins` in `.claude-plugin/marketplace.json`.
 3. Add a row to the table above and a `README.md` in the mod's folder.
-4. Run `scripts/check.ps1`.
+4. Run `bash scripts/check.sh`.
 
 ## Development
 
 Install from a local clone so Claude Code reads your working copy:
 
-```powershell
+```bash
 claude plugin marketplace add <path to clone>
 ```
 
-```powershell
+```bash
 claude plugin install <mod>@claude-mods
 ```
 
@@ -59,14 +59,14 @@ After an edit, run `/reload-plugins`. Do not also install the GitHub copies on t
 
 To try a mod for one session only (with its installed copy disabled):
 
-```powershell
+```bash
 claude --plugin-dir <path to clone>/<mod>
 ```
 
 Validate the marketplace and every mod, and run their tests:
 
-```powershell
-pwsh scripts/check.ps1
+```bash
+bash scripts/check.sh
 ```
 
 Bump `version` in a mod's `.claude-plugin/plugin.json` for each release, so `claude plugin update` picks it up.

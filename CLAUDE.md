@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Run from the repo root in PowerShell.
+Run from the repo root.
 
 | Task | Command |
 | --- | --- |
-| Validate the marketplace and every listed mod, run every mod's tests, flag unlisted mod folders | `pwsh scripts/check.ps1` |
+| Validate the marketplace and every listed mod, run every mod's tests, flag unlisted mod folders | `bash scripts/check.sh` |
 | Type-check one mod | `npx -y -p typescript@5.6.3 tsc -p <mod>` |
 
 - `<mod>/tsconfig.json` extends `<mod>/.claude-plugin/types/tsconfig.json`, which Claude Code generates when it loads the mod and git ignores. In a fresh clone, type-checking works only after the mod has been loaded once (`claude --plugin-dir <mod>`).
