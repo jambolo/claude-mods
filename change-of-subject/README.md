@@ -9,9 +9,11 @@ turns about something else. This mod catches both at the door.
 Each prompt is judged against the session it was typed into, and only two verdicts stop anything:
 
 - **Another subject.** A pop-up offers to ask it with `/btw` instead, which answers a side question without touching the
-  main conversation. Say yes and the prompt goes there; say *Continue here* and it lands as typed.
+  main conversation. Say yes and the prompt goes there; say *Continue here* and it lands as typed, as it does with *Not a
+  side trip*, which also tells the mod the judge got it wrong.
 - **A new direction or phase in the same work.** A pop-up offers a fresh session, a compaction, or carrying on here.
-  Pick one and the mod runs it, then sends your prompt again, in the session the command left behind.
+  Pick one and the mod runs it, then sends your prompt again, in the session the command left behind. *Not a new phase*
+  carries on here and tells the mod the judge got it wrong.
 
 Neither pop-up argues its case: you can see your own prompt and the session it landed in. The verdict and the judge's
 few words of reason are in `/change-of-subject` when you want them.
@@ -29,12 +31,18 @@ Anything the judge calls part of the work in hand goes straight through with no 
 One request to Claude Haiku (about 1k tokens) for each prompt worth judging. Not every prompt is: the first prompt of a
 session has nothing to be unrelated to, a bare answer or nudge (`ok`, `go on`, `try again`) carries no subject of its
 own, a slash command or a `#` memory line is not a prompt at all, and a prompt typed again is a retry. `/change-of-subject off` stops the judging for the session.
+Once you have labels (see [What it learns](#what-it-learns)), each request also carries up to four of your past calls
+and your rules, a few hundred tokens more. A label made while Jev judges, or by `/change-of-subject was`, costs one more
+Claude Haiku request to explain it, and every ten of a judge's mistakes one request to Claude Sonnet draws its rules
+again.
 
 With `/change-of-subject jev`, the same prompts are judged instead by [Jev](https://docs.typesafe.ai/introduction),
 TypeSafe AI's decision model: one request to `api.typesafe.ai` each, billed by TypeSafe to the key in
 `TYPESAFE_API_KEY` (get one from the [TypeSafe console](https://console.typesafe.ai/keys) and set it before starting
-Claude Code). The prompt and the session lines the judge sees then go to TypeSafe, not Anthropic. Jev picks `same`,
-`aside` or `phase`, and `aside` or `phase` interrupts only when Jev is at least 70% sure of it.
+Claude Code). The prompt, the session lines the judge sees, up to four past calls from this project and your rules then
+go to TypeSafe; past calls from other projects never do. A prompt you answer a pop-up about, and its session, also go to
+Claude Haiku to be explained. Jev picks `same`, `aside` or `phase`, and `aside` or `phase` interrupts only when Jev is at
+least 70% sure of it, until your labels set another bar.
 
 ## Commands
 
@@ -45,19 +53,63 @@ Claude Code). The prompt and the session lines the judge sees then go to TypeSaf
 | `/change-of-subject on` | Start again, judged by Claude Haiku. |
 | `/change-of-subject haiku` | Judge with Claude Haiku, the default. The same as `on`. |
 | `/change-of-subject jev` | Judge with Jev instead. Refused while `TYPESAFE_API_KEY` is unset. |
+| `/change-of-subject was <same\|aside\|phase> [user\|local]` | Correct the last prompt the judge ruled on, for this project (`local`) or for every project (`user`); unnamed, where new labels go. |
+| `/change-of-subject learn [user\|local\|off]` | Say where new labels are kept, or set it: this project (the default), every project, or nowhere. |
+| `/change-of-subject lessons [user\|local]` | Each scope's labels, how sure the judge must be to interrupt, and the rules drawn from them. |
+| `/change-of-subject promote` | Copy this project's labels to every project's. |
+| `/change-of-subject forget <user\|local>` | Forget a scope's labels and rules. |
 
-Each of these is session-only by design: every new session starts watching, judged by Claude Haiku.
+`off`, `on`, `haiku` and `jev` are session-only by design: every new session starts watching, judged by Claude Haiku.
+The rest change what is learned, and last.
 
-## The three choices for a new phase
+## The four choices for a new phase
 
 Claude Code's `/clear` *is* "start a new session with empty context; previous session stays on disk (resumable with
-`/resume`)", so **New session** and clearing the session are one button, not two. The three are:
+`/resume`)", so **New session** and clearing the session are one button, not two. The four are:
 
 | Choice | What runs | What you keep |
 | --- | --- | --- |
 | **New session** | `/clear` | Nothing in context. The session you left stays on disk, resumable with `/resume`. |
 | **Compact first** | `/compact` | A summary of the work so far, with the room back. |
 | **Continue here** | nothing | Everything, as it was. |
+| **Not a new phase** | nothing | Everything, as it was, and the judge's mistake is noted. |
+
+## What it learns
+
+Your answers are kept as labels, and the judge is taught from them:
+
+- **Ask with /btw**, **New session** and **Compact first** bear the judge out. **Not a side trip** and **Not a new
+  phase** turn it down, and say only what the prompt was not: a prompt that is not a side trip may still start a new
+  phase. **Continue here** and a dismissed pop-up say nothing: you may agree and still want the prompt here.
+- `/change-of-subject was` names what the last prompt the judge ruled on was, including one it let through without a
+  pop-up.
+
+Whether a prompt is a side trip or a new phase depends on the session it was typed into, so a label keeps how the two
+compared: one sentence from Claude Haiku saying what the session was doing and how the prompt related to it. When Claude
+Haiku judges, it writes that sentence with its own verdict; when Jev judges, or for `was`, Claude Haiku is asked
+separately, after the prompt has gone through, and the label holds the session's lines only until then.
+
+A label also keeps the judge's verdict and its reason, on this machine, in the mod's own store under your Claude Code
+directory: the last 100 for each project and 500 for every project, with the ones that bore the judge out let go before
+its mistakes. A project nobody opens for 90 days has its labels let go. Nothing is learned while `/change-of-subject off`
+is in force, and `/change-of-subject learn off` keeps only the corrections you make with `was`.
+
+A call you bore out is the right answer whichever judge made it, so it teaches both; a mistake shows how one judge
+decides, so it teaches that judge alone. The judge is taught three ways, this project's labels first and every project's
+after:
+
+- **Past calls.** Each request shows the judge up to four of your calls, whatever the new prompt's words: its own
+  mistakes first, then one call of each verdict, then the newest. Each shows the prompt, how it compared with its
+  session, and the verdict you gave or turned down.
+- **How sure is sure enough.** Claude Haiku says how sure it is of each call. Once a scope holds 20 of a judge's calls
+  of one verdict, the mod finds the lowest sureness at which four in five of those calls were right, and a call below it
+  goes through without a pop-up. Until then Claude Haiku interrupts whenever it calls a side trip or a new phase, and
+  Jev only from 70% sure.
+- **Rules.** Every ten of a judge's mistakes, Claude Sonnet reads the calls that teach it, with their comparisons, the
+  judge's reasons and your word on them, and writes at most ten short rules about how a prompt relates to its session's
+  work. The judge reads them with every prompt. They never quote your prompts.
+
+`/change-of-subject lessons` shows what each scope has learned.
 
 ## What it does not do
 
@@ -71,7 +123,8 @@ Claude Code's `/clear` *is* "start a new session with empty context; previous se
   says why in a toast, once for each new failure rather than once per prompt, and `/change-of-subject` shows why the
   last prompt went through unjudged.
 - It does not read your transcript. The judge sees the last twelve lines of the session as this mod recorded them — your
-  prompts and the first part of Claude's answers — and both are marked to it as material, not as instructions.
+  prompts, the first part of Claude's answers and the files Claude changed — and the session's first prompt once those
+  lines have let go of it, all marked to it as material, not as instructions.
 - **New session** sends your prompt again in the session `/clear` left behind. When the engine will not take it there,
   the prompt is put back in the box for you to send; it is never silently dropped.
 - The judge is a small model making a judgement call, and it will be wrong sometimes. It is told to prefer "same"

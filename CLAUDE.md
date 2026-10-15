@@ -24,4 +24,8 @@ Run from the repo root.
 
 ## Releasing
 
-Bump `version` in `<mod>/.claude-plugin/plugin.json` for each release: GitHub installs only pick up changes through a new version and `claude plugin update`. A local install from this folder (`claude plugin marketplace add <repo>`, then `claude plugin install <mod>@claude-mods`) reads the working copy directly after `/reload-plugins`; don't also install the GitHub copy on the same machine.
+Bump `version` in `<mod>/.claude-plugin/plugin.json` for each release. Every install runs a cached copy, a GitHub install and a local one from this folder (`claude plugin marketplace add <repo>`, then `claude plugin install <mod>@claude-mods`) alike: `~/.claude/plugins/cache/claude-mods/<mod>/<version>`, the `installPath` in `~/.claude/plugins/installed_plugins.json`. A change reaches a session only through a new version, then `claude plugin update <mod>@claude-mods`, then `/reload-plugins`.
+
+- `claude plugin list` says a local install is "Read from" this folder, but the session runs the cached copy. When unsure which version is running, read `installPath`.
+- To run the working copy without a new version, start a session with `claude --plugin-dir <mod>`.
+- Don't also install the GitHub copy on the same machine.
