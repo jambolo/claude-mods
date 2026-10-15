@@ -1,4 +1,4 @@
-import type { On } from 'claude-code'
+import type { HttpInit, On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
@@ -11,6 +11,9 @@ import {
   beatOf,
   briefing,
   isWorthJudging,
+  jevRefused,
+  jevRequest,
+  readJev,
   readVerdict,
   remember,
   report,
@@ -20,6 +23,16 @@ const SESSION = { cwd: 'C:/repo', surface: 'terminal' as const, isInteractive: t
 const USAGE = { input_tokens: 500, output_tokens: 12, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 // Long enough to pass the delay the mod waits before it runs a command in a prompt's place.
 const SETTLED_MS = 400
+// Long enough for the mod to stop waiting on a Jev that never answers.
+const JEV_GIVEN_UP_MS = 5_000
+
+/** A Jev reply picking `choice`, `sure` of it. */
+const jevSays = (choice: string, sure: number): string =>
+  JSON.stringify({
+    model: 'jev-1.13.0',
+    answers: { belongs: { type: 'choice', choice, probabilities: { [choice]: sure }, confidence: sure } },
+    usage: { input_tokens: 400, output_tokens: 10 },
+  })
 
 type World = {
   /** What the judge answers, one per prompt it is asked about. */
@@ -39,6 +52,14 @@ type World = {
   unsendable: string[]
   /** The prompts put in the person's box instead. */
   filled: string[]
+  /** The environment, as the mod reads it. */
+  env: Record<string, string>
+  /** What Jev answers, one reply per prompt it is asked about. */
+  jev: string[]
+  /** The requests sent to Jev. */
+  fetched: { url: string; init?: HttpInit }[]
+  /** The toasts the mod raised. */
+  toasts: string[]
 }
 
 /** The engine around the mod: a judge and a dialog that answer what the test queued up. */
@@ -54,6 +75,10 @@ function worldOf(on: On): World {
     filled: [],
     failing: [],
     pending: null,
+    env: {},
+    jev: [],
+    fetched: [],
+    toasts: [],
   }
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -64,10 +89,39 @@ function worldOf(on: On): World {
   on('model.complete', ($, e) => {
     w.briefings.push(String(e.prompt))
     const said = w.verdicts.shift() ?? 'same'
-    // A queued 'throw' stands for a judge that is not there.
+    // A queued 'throw' stands for a judge that is not there, 'overloaded' for one the API turned away.
     if (said === 'throw') throw new Error('no model today')
+    if (said === 'overloaded') {
+      return {
+        value: { isAnswered: false as const, reason: 'api-error' as const, status: 529, error: 'overloaded' as const, usage: USAGE },
+      }
+    }
 
     return { value: { isAnswered: true as const, text: said, usage: USAGE } }
+  })
+
+  on('env.get', ($, e) => ({ value: w.env[e.name] }))
+
+  on('http.fetch', ($, e) => {
+    w.fetched.push(e)
+    const said = w.jev.shift() ?? jevSays('same', 0.9)
+    // A queued 'throw' stands for a request that failed, 'hang' for a Jev that never answers,
+    // 'refused' for a key Jev does not take.
+    if (said === 'throw') throw new Error('no network today')
+    if (said === 'hang') return new Promise<never>(() => {})
+    if (said === 'refused') {
+      const text = '{"detail":{"error_type":"authentication_error","message":"Invalid API key."}}'
+
+      return { value: { status: 403, ok: false, headers: {}, text } }
+    }
+
+    return { value: { status: 200, ok: true, headers: {}, text: said } }
+  })
+
+  on('ui.toast', ($, e) => {
+    w.toasts.push(e.text)
+
+    return { value: undefined }
   })
 
   // $.ui.ask is raised as a call to the AskUserQuestion tool.
@@ -156,6 +210,32 @@ test('the judge is read for its one word, and an answer nobody can read carries 
   expect(readVerdict('I think this one is unrelated')).toEqual({ verdict: 'same', reason: '' })
 })
 
+test('Jev is read for its pick, and only a sure aside or phase interrupts', () => {
+  expect(readJev(jevSays('aside', 0.91))).toEqual({ verdict: 'aside', reason: 'Jev, 91% sure' })
+  expect(readJev(jevSays('phase', 0.55)), 'a close call carries on').toEqual({
+    verdict: 'same',
+    reason: 'Jev, 55% sure of phase',
+  })
+  expect(readJev(jevSays('same', 0.8))).toEqual({ verdict: 'same', reason: 'Jev, 80% sure' })
+  const unread = { verdict: 'same', reason: '', failure: "Jev's answer could not be read" }
+  expect(readJev(jevSays('billing', 0.99)), 'an option it was never offered').toEqual(unread)
+  expect(readJev('<html>502 Bad Gateway</html>')).toEqual(unread)
+  expect(jevRefused(403, '{"detail":{"error_type":"authentication_error"}}')).toBe(
+    'Jev refused the request: HTTP 403 (authentication_error)',
+  )
+  expect(jevRefused(502, '<html>502 Bad Gateway</html>')).toBe('Jev refused the request: HTTP 502')
+})
+
+test('Jev is asked one Choice question, with the briefing as its state', () => {
+  const log = remember(EMPTY, beatOf('you', 'write a parser'))
+  const sent = JSON.parse(jevRequest(log, 'now publish it'))
+
+  expect(sent.model).toBe('jev-1.13.0')
+  expect(sent.state).toBe(briefing(log, 'now publish it'))
+  expect(sent.questions.belongs.type).toBe('choice')
+  expect(Object.keys(sent.questions.belongs.criteria)).toEqual(['same', 'aside', 'phase'])
+})
+
 test('the briefing carries the session and the new prompt, both marked as material', () => {
   const log = remember(remember(EMPTY, beatOf('you', 'write a parser')), beatOf('claude', 'Done:\n  two files.'))
   const text = briefing(log, 'now  publish it')
@@ -168,10 +248,15 @@ test('the briefing carries the session and the new prompt, both marked as materi
 test('the report says whether prompts are being watched and what the last verdict was', () => {
   const log = remember(EMPTY, beatOf('you', 'write a parser'))
 
-  expect(report(true, 0, null, EMPTY)).toContain('Watching every prompt')
-  expect(report(false, 0, null, EMPTY)).toContain('Not watching')
-  expect(report(true, 1, { verdict: 'phase', reason: 'the release' }, log)).toContain('1 prompt judged')
-  expect(report(true, 1, { verdict: 'phase', reason: 'the release' }, log)).toContain('**phase**: the release')
+  expect(report('haiku', 0, null, EMPTY)).toContain('Watching every prompt')
+  expect(report('off', 0, null, EMPTY)).toContain('Not watching')
+  expect(report('haiku', 1, { verdict: 'phase', reason: 'the release' }, log)).toContain('1 prompt judged')
+  expect(report('haiku', 1, { verdict: 'phase', reason: 'the release' }, log)).toContain('**phase**: the release')
+  expect(report('haiku', 0, null, EMPTY)).toContain('judged by Claude Haiku')
+  expect(report('jev', 0, null, EMPTY)).toContain('judged by Jev')
+  expect(report('jev', 0, { verdict: 'same', reason: '', failure: 'Jev did not answer within 5s' }, log)).toContain(
+    'The last prompt went through unjudged: Jev did not answer within 5s.',
+  )
 })
 
 test('the first prompt of a session goes straight through, unjudged', async ($, on) => {
@@ -260,7 +345,7 @@ test('a prompt held for a new session is sent again in the session /clear leaves
   expect(w.commands).toEqual([{ command: 'clear', args: '' }])
   expect(w.through, 'nothing is sent while /clear is still running').toEqual(['write a parser for the config file'])
 
-  await $.session.end({ reason: 'clear' })
+  await $.session.end({ reason: 'clear', sessionId: 'the-session-cleared', resume: { id: 'the-session-cleared' } })
   await $.session.start(SESSION)
   await clock.advance(SETTLED_MS)
 
@@ -445,4 +530,122 @@ test('a judge that fails costs nobody their prompt', async ($, on) => {
   expect(w.briefings.length).toBe(1)
   expect(w.questions).toEqual([])
   expect(w.through).toEqual(['write a parser for the config file', 'what is the capital of Peru?'])
+  // The engine's own words for why the call failed follow the colon.
+  expect(w.toasts.length, 'the person is told').toBe(1)
+  expect(w.toasts[0]).toMatch(/^Claude Haiku could not be asked: .+ Prompts go through unjudged while it fails; `\/change-of-subject off` stops the judging\.$/)
+  expect(JSON.stringify(await runCommand($, ''))).toContain('0 prompts judged')
+})
+
+test('a failing judge is told once per failure, not once per prompt', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.verdicts = ['overloaded', 'overloaded', 'same: the next step of the parser', 'overloaded']
+
+  await $.session.start(SESSION)
+  await say($, 'write a parser for the config file')
+  await say($, 'now add a test for it')
+  await say($, 'and one for blank lines')
+  await say($, 'and one for comments')
+  await say($, 'and one for quoted values')
+
+  expect(w.briefings.length).toBe(4)
+  expect(w.toasts.length, 'once, and again after it came back and failed anew').toBe(2)
+  expect(w.toasts[0]).toContain("Claude Haiku's request failed: HTTP 529 (overloaded)")
+  expect(JSON.stringify(await runCommand($, ''))).toContain('1 prompt judged')
+})
+
+test('/change-of-subject jev needs a key, and Claude Haiku judges until there is one', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+
+  await $.session.start(SESSION)
+  expect(JSON.stringify(await runCommand($, 'jev'))).toContain('TYPESAFE_API_KEY')
+
+  await say($, 'write a parser for the config file')
+  await say($, 'now add a test for it')
+
+  expect(w.briefings.length).toBe(1)
+  expect(w.fetched).toEqual([])
+})
+
+test('/change-of-subject jev has Jev judge each prompt in place of Claude Haiku, until haiku', async ($, on) => {
+  const w = worldOf(on)
+  const clock = mock.clock(on, { now: 1_000 })
+  w.env = { TYPESAFE_API_KEY: 'sk-test' }
+  w.jev = [jevSays('aside', 0.93)]
+  w.answers = [USE_BTW]
+
+  await $.session.start(SESSION)
+  expect(JSON.stringify(await runCommand($, 'jev')), 'it says where prompts go').toContain('api.typesafe.ai')
+  expect(JSON.stringify(await runCommand($, ''))).toContain('judged by Jev')
+
+  await say($, 'write a parser for the config file')
+  await say($, 'what is the capital of Peru?')
+  await clock.advance(SETTLED_MS)
+
+  expect(w.briefings, 'Claude Haiku was not asked').toEqual([])
+  expect(w.fetched.map(f => f.url)).toEqual(['https://api.typesafe.ai/v1/systemone'])
+  expect(w.fetched[0]?.init?.headers?.Authorization).toBe('Bearer sk-test')
+  expect(w.commands).toEqual([{ command: 'btw', args: 'what is the capital of Peru?' }])
+  expect(JSON.stringify(await runCommand($, ''))).toContain('**aside**: Jev, 93% sure')
+
+  expect(JSON.stringify(await runCommand($, 'haiku'))).toContain('Claude Haiku')
+  await say($, 'and the capital of Chile?')
+
+  expect(w.briefings.length).toBe(1)
+  expect(w.fetched.length).toBe(1)
+
+  await runCommand($, 'jev')
+  await runCommand($, 'off')
+  expect(JSON.stringify(await runCommand($, 'on')), 'on starts again with the default judge').toContain('Claude Haiku')
+})
+
+test('a Jev that fails or never answers costs nobody their prompt', async ($, on) => {
+  const w = worldOf(on)
+  const clock = mock.clock(on, { now: 1_000 })
+  w.env = { TYPESAFE_API_KEY: 'sk-test' }
+  w.jev = ['throw', 'hang']
+
+  await $.session.start(SESSION)
+  await runCommand($, 'jev')
+  await say($, 'write a parser for the config file')
+  await say($, 'what is the capital of Peru?')
+  const waiting = say($, 'and the capital of Chile?')
+  await clock.advance(JEV_GIVEN_UP_MS)
+  await waiting
+
+  expect(w.fetched.length).toBe(2)
+  expect(w.toasts.length).toBe(2)
+  expect(w.toasts[0]).toMatch(/^Jev could not be reached: /)
+  expect(w.toasts[1]).toMatch(/^Jev did not answer within 5s\. /)
+  expect(w.toasts[0], 'it says how to get out of it').toContain('`/change-of-subject haiku`')
+  const said = JSON.stringify(await runCommand($, ''))
+  expect(said, 'neither counts as judged').toContain('0 prompts judged')
+  expect(said).toContain('went through unjudged: Jev did not answer within 5s')
+  expect(w.questions).toEqual([])
+  expect(w.through).toEqual([
+    'write a parser for the config file',
+    'what is the capital of Peru?',
+    'and the capital of Chile?',
+  ])
+})
+
+test('a key Jev refuses is told once, with the kind of error Jev named', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.env = { TYPESAFE_API_KEY: 'sk-revoked' }
+  w.jev = ['refused', 'refused']
+
+  await $.session.start(SESSION)
+  await runCommand($, 'jev')
+  await say($, 'write a parser for the config file')
+  await say($, 'what is the capital of Peru?')
+  await say($, 'and the capital of Chile?')
+
+  expect(w.fetched.length).toBe(2)
+  expect(w.toasts).toEqual([
+    'Jev refused the request: HTTP 403 (authentication_error). Prompts go through unjudged while it fails; `/change-of-subject haiku` switches to Claude Haiku.',
+  ])
+  expect(w.questions).toEqual([])
+  expect(w.through.length).toBe(3)
 })

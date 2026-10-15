@@ -30,15 +30,23 @@ One request to Claude Haiku (about 1k tokens) for each prompt worth judging. Not
 session has nothing to be unrelated to, a bare answer or nudge (`ok`, `go on`, `try again`) carries no subject of its
 own, a slash command or a `#` memory line is not a prompt at all, and a prompt typed again is a retry. `/change-of-subject off` stops the judging for the session.
 
+With `/change-of-subject jev`, the same prompts are judged instead by [Jev](https://docs.typesafe.ai/introduction),
+TypeSafe AI's decision model: one request to `api.typesafe.ai` each, billed by TypeSafe to the key in
+`TYPESAFE_API_KEY` (get one from the [TypeSafe console](https://console.typesafe.ai/keys) and set it before starting
+Claude Code). The prompt and the session lines the judge sees then go to TypeSafe, not Anthropic. Jev picks `same`,
+`aside` or `phase`, and `aside` or `phase` interrupts only when Jev is at least 70% sure of it.
+
 ## Commands
 
-| | |
-|---|---|
-| `/change-of-subject` | Whether prompts are being judged, how many have been, and the last verdict. |
+| Command | What it does |
+| --- | --- |
+| `/change-of-subject` | Whether prompts are being judged and by which judge, how many have been, and the last verdict. |
 | `/change-of-subject off` | Stop judging prompts in this session. |
-| `/change-of-subject on` | Start again. |
+| `/change-of-subject on` | Start again, judged by Claude Haiku. |
+| `/change-of-subject haiku` | Judge with Claude Haiku, the default. The same as `on`. |
+| `/change-of-subject jev` | Judge with Jev instead. Refused while `TYPESAFE_API_KEY` is unset. |
 
-`off` and `on` are session-only by design: every new session starts watching.
+Each of these is session-only by design: every new session starts watching, judged by Claude Haiku.
 
 ## The three choices for a new phase
 
@@ -46,7 +54,7 @@ Claude Code's `/clear` *is* "start a new session with empty context; previous se
 `/resume`)", so **New session** and clearing the session are one button, not two. The three are:
 
 | Choice | What runs | What you keep |
-|---|---|---|
+| --- | --- | --- |
 | **New session** | `/clear` | Nothing in context. The session you left stays on disk, resumable with `/resume`. |
 | **Compact first** | `/compact` | A summary of the work so far, with the room back. |
 | **Continue here** | nothing | Everything, as it was. |
@@ -59,7 +67,9 @@ Claude Code's `/clear` *is* "start a new session with empty context; previous se
   arrive here as typed, so they are matched by their first character and left exactly as they are: a command you meant
   to run is never spent on a side question. A `!` shell line never reaches the mod at all.
 - It never costs you a prompt. A judge that fails, times out or answers something unreadable, and a pop-up you dismiss,
-  all leave the prompt exactly as you typed it.
+  all leave the prompt exactly as you typed it. Jev gets 5 seconds, Claude Haiku 15. A judge that fails or times out
+  says why in a toast, once for each new failure rather than once per prompt, and `/change-of-subject` shows why the
+  last prompt went through unjudged.
 - It does not read your transcript. The judge sees the last twelve lines of the session as this mod recorded them — your
   prompts and the first part of Claude's answers — and both are marked to it as material, not as instructions.
 - **New session** sends your prompt again in the session `/clear` left behind. When the engine will not take it there,
