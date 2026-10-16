@@ -3,7 +3,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelCompleteResult, Register } from 'claude-code'
 
-import type { Beat, Call, Example, Judge, Judgement, Learning, Lessons, Scope, Teaching, Truth, Verdict } from '../types'
+import type { Beat, Calibration, Call, Example, Interrupting, Judge, Judgment, Learning, Lessons, Scope, Teaching, Truth, Verdict } from '../types'
 import {
   ASIDE_HEADER,
   ASIDE_QUESTION,
@@ -18,6 +18,7 @@ import {
   PHASE_HEADER,
   PHASE_QUESTION,
   USE_BTW,
+  bearsOut,
   beatOf,
   callOf,
   clip,
@@ -37,12 +38,14 @@ import {
   report,
   scopeOf,
   sessionOf,
+  sizeOf,
   squash,
 } from './model'
 import {
   EXPLAIN_SYSTEM,
   LESSONS_SYSTEM,
   UNTAUGHT,
+  answeredIn,
   barsFor,
   explainBrief,
   gate,
@@ -53,6 +56,8 @@ import {
   pastCalls,
   readExplanation,
   readLessons,
+  recountedIn,
+  reopenedIn,
   scopeReport,
 } from './teach'
 import type { Bars } from './teach'
@@ -76,21 +81,22 @@ const USAGE = [
   "- `promote` copies this project's labels to every project's",
   "- `forget <user | local>` forgets a scope's labels and rules",
 ].join('\n')
-const NO_KEY = 'Jev needs `TYPESAFE_API_KEY` set where Claude Code started. The judge is unchanged.'
+const NO_KEY = 'Jev needs `TYPESAFE_API_KEY` set to a key where Claude Code started. The judge is unchanged.'
 const NOTHING_RULED = 'Nothing judged yet in this session, so nothing to correct.'
 /** What `/change-of-subject` answers on switching to each judge. */
 const SAID: Record<Judge, string> = {
   off: 'Not watching prompts any more. `/change-of-subject on` starts again.',
   haiku: 'Watching every prompt, judged by Claude Haiku.',
-  jev: `Watching every prompt, judged by Jev. Warning: each prompt judged, with the last ${BEATS} lines of the session, a few past calls from this project and the rules drawn from your labels, goes to TypeSafe AI (api.typesafe.ai).`,
+  jev: `Watching every prompt, judged by Jev. Warning: each prompt judged, with the last ${BEATS} lines of the session, a few past calls and the rules drawn from your labels, goes to TypeSafe AI (api.typesafe.ai). Past calls and rules kept for every project carry prompts from other projects.`,
 }
 /** What the toast for a failing judge suggests doing about it. */
 const WHILE_FAILING: Record<Judging, string> = {
   haiku: '`/change-of-subject off` stops the judging.',
   jev: '`/change-of-subject haiku` switches to Claude Haiku.',
 }
-/** How the commands name each scope. */
+/** How the commands name each scope, within a sentence and at its head. */
 const SCOPE_NAMES: Record<Scope, string> = { local: 'this project', user: 'every project' }
+const SCOPE_TITLES: Record<Scope, string> = { local: 'This project', user: 'Every project' }
 /** What `/change-of-subject learn` says of where labels go. */
 const LEARNING: Record<Learning, string> = {
   local: 'New labels are kept for this project.',
@@ -182,7 +188,7 @@ function act($: EngineInterface, command: string, args: string, back: HandBack):
   })
 }
 
-async function askAbout($: EngineInterface, j: Judgement): Promise<string> {
+async function askAbout($: EngineInterface, j: Judgment): Promise<string> {
   const isAside = j.verdict === 'aside'
   try {
     return await $.ui.ask(isAside ? ASIDE_QUESTION : PHASE_QUESTION, {
@@ -255,7 +261,7 @@ async function draw($: EngineInterface, scope: Scope, by: Judging): Promise<void
  */
 async function drawIfDue($: EngineInterface, scope: Scope, by: Judging, examples: Example[]): Promise<void> {
   const key = `${scope}:${by}`
-  if (drawing.has(key) || !isDue(examples, (await readScope($, scope)).lessons[by], by)) return
+  if (drawing.has(key) || !isDue(examples, await lessonsAt($, await keyOf($, scope, `lessons:${by}`)), by)) return
 
   drawing.add(key)
   $.clock.after(ACT_MS, () => {
@@ -281,22 +287,25 @@ async function teach($: EngineInterface, scope: Scope, example: Example): Promis
 
 /**
  * What the judge is taught, and the bars its calls must clear: this project's labels and
- * rules first, then every project's. Jev is shown past calls from this project only:
- * everything it is shown goes to TypeSafe, and another project's prompts have no business
- * there.
+ * rules first, then every project's, whichever judge is asked.
  */
 async function teachingFor($: EngineInterface, by: Judging): Promise<{ teaching: Teaching; bars: Bars }> {
   try {
-    const here = await readScope($, 'local')
-    const everywhere = await readScope($, 'user')
+    const [here, everywhere, hereCalls, everywhereCalls, first] = await Promise.all([
+      readScope($, 'local'),
+      readScope($, 'user'),
+      calibrationAt($, 'local', by),
+      calibrationAt($, 'user', by),
+      read($, anchor),
+    ])
 
     return {
       teaching: {
-        anchor: await read($, anchor),
-        examples: pastCalls(by === 'jev' ? [here.examples] : [here.examples, everywhere.examples], by),
+        anchor: first,
+        examples: pastCalls([here.examples, everywhere.examples], by),
         lessons: [everywhere.lessons[by]?.text ?? '', here.lessons[by]?.text ?? ''],
       },
-      bars: barsFor([here.examples, everywhere.examples], by),
+      bars: barsFor([hereCalls, everywhereCalls], by),
     }
   } catch {
     // A store nobody can read teaches nothing; the judge still judges.
@@ -317,29 +326,30 @@ async function hear($: EngineInterface, by: Judging, beats: Beat[], text: string
   if (!isWorthJudging(text, beats)) return UNHEARD
 
   const { teaching, bars } = await teachingFor($, by)
-  const judgement = gate(await judgeWith($, by, beats, text, teaching), bars)
+  const judgment = gate(await judgeWith($, by, beats, text, teaching), bars)
   const before = await read($, last)
-  await update($, last, () => judgement)
+  await update($, last, () => judgment)
 
-  if (judgement.failure !== undefined) {
+  if (judgment.failure !== undefined) {
     // Once per failure, not once per prompt: a key that is refused is refused every time.
-    if (judgement.failure !== before?.failure) {
-      $.ui.toast(`${judgement.failure}. Prompts go through unjudged while it fails; ${WHILE_FAILING[by]}`)
+    if (judgment.failure !== before?.failure) {
+      $.ui.toast(`${judgment.failure}. Prompts go through unjudged while it fails; ${WHILE_FAILING[by]}`)
     }
 
     return UNHEARD
   }
 
   await update($, judged, n => n + 1)
-  const choice = judgement.verdict === 'same' ? '' : await askAbout($, judgement)
+  const choice = judgment.verdict === 'same' ? '' : await askAbout($, judgment)
 
-  return { ...callOf(judgement), ...explanationOf(judgement), said: judgement.verdict, choice }
+  return { ...callOf(judgment), ...explanationOf(judgment), said: judgment.verdict, choice }
 }
 
 /**
  * Keeps a judged prompt as the ruling `was` corrects and, when the person's answer to the
  * pop-up bore the verdict out or turned it down, as a label: with Claude Haiku's comparison
- * when it judged, else with the session, for Claude Haiku to explain.
+ * when it judged, else with the session, for Claude Haiku to explain. The answer is also
+ * counted in its judge's tally.
  */
 async function learnFromPrompt($: EngineInterface, by: Judging, text: string, beats: Beat[], heard: Heard): Promise<void> {
   const { said, choice, ...call } = heard
@@ -353,19 +363,22 @@ async function learnFromPrompt($: EngineInterface, by: Judging, text: string, be
     const session = sessionOf(beats, await read($, anchor))
     const scope = outcome === undefined || into === 'off' ? null : into
     await update($, ruling, () => ({ ...call, at, prompt, said, judge: by, session, scope }))
-    if (outcome === undefined || scope === null) return
+    if (outcome === undefined || said === 'same') return
 
-    const truth: Truth = outcome === 'confirmed' ? { is: said } : { not: said }
-    await teach($, scope, {
-      ...call,
-      at,
-      prompt,
-      judge: by,
-      said,
-      truth,
-      source: 'dialog',
-      ...(call.comparison === undefined ? { session } : {}),
-    })
+    if (scope !== null) {
+      const truth: Truth = outcome === 'confirmed' ? { is: said } : { not: said }
+      await teach($, scope, {
+        ...call,
+        at,
+        prompt,
+        judge: by,
+        said,
+        truth,
+        source: 'dialog',
+        ...(call.comparison === undefined ? { session } : {}),
+      })
+    }
+    if (call.sure !== undefined) await countAnswer($, scope, by, said, call.sure, outcome === 'confirmed')
   } catch {
     // A label nobody can keep costs a lesson, never the prompt.
   }
@@ -384,6 +397,7 @@ async function decide($: EngineInterface, text: string, originKind: string | und
   if (originKind !== undefined && originKind !== 'unclassified' && originKind !== 'composer') return ''
 
   try {
+    await use($).catch(() => undefined)
     const by = await read($, judge)
     if (by === 'off') return ''
 
@@ -402,6 +416,9 @@ async function decide($: EngineInterface, text: string, originKind: string | und
  * `/change-of-subject was`: relabels the last prompt a judge ruled on, in the scope named
  * or else where new labels go. A correction is kept even while labels are not. The label
  * it replaces gives up its comparison, so Claude Haiku is asked only when there is none.
+ * A pop-up answer it turns around moves in the tally; a right call the bar held back
+ * reopens the bar down to it. `was` is never counted otherwise: the person picks which
+ * prompts to correct, so its labels are no fair sample of the judge.
  */
 async function appeal($: EngineInterface, args: string): Promise<string> {
   const was = readWas(args)
@@ -426,6 +443,15 @@ async function appeal($: EngineInterface, args: string): Promise<string> {
       source: 'was',
       ...(explained.comparison === undefined ? { session } : {}),
     })
+    if (seen.pick !== undefined && seen.pick !== 'same' && seen.sure !== undefined) {
+      const isRight = was.label === seen.pick
+      const wasRight = before?.source === 'dialog' ? bearsOut(before.truth, seen.pick) : undefined
+      if (scope !== null && wasRight !== undefined && wasRight !== isRight) {
+        await recount($, scope, seen.judge, seen.pick, seen.sure, isRight)
+      } else if (seen.said === 'same' && isRight) {
+        await reopen($, kept, seen.judge, seen.pick, seen.sure)
+      }
+    }
     await update($, ruling, () => ({ ...one, scope: kept }))
 
     return `Noted for ${SCOPE_NAMES[kept]}: “${clip(one.prompt, QUOTED_CHARS)}” was **${was.label}**.`
@@ -460,8 +486,7 @@ async function lessons($: EngineInterface, words: string[]): Promise<string> {
     const reports: string[] = []
     for (const s of scope === undefined ? (['local', 'user'] as const) : [scope]) {
       const kept = await readScope($, s)
-      const name = SCOPE_NAMES[s]
-      reports.push(scopeReport(`${name[0]?.toUpperCase()}${name.slice(1)}`, kept.examples, kept.lessons[by], by))
+      reports.push(scopeReport(SCOPE_TITLES[s], kept.examples, kept.lessons[by], await calibrationAt($, s, by), by))
     }
 
     return reports.join('\n\n')
@@ -501,19 +526,52 @@ async function forgotten($: EngineInterface, words: string[]): Promise<string> {
 // Claude Code 2.1.295 follows `$` only into functions declared in this file, never across an import,
 // and these take `$`.
 
-/** What a scope keeps: its labels, and each judge's rules drawn from them. */
-type Kind = 'examples' | `lessons:${Judging}`
+/** What a scope keeps: its labels, and each judge's rules drawn from them and tally of its answered calls. */
+type Kind = 'examples' | `lessons:${Judging}` | `calls:${Judging}`
 
 /** A scope's labels and each judge's rules, as the store holds them. */
 type Kept = { examples: Example[]; lessons: Partial<Record<Judging, Lessons>> }
 
+type Bytes = Partial<Record<Kind, number>>
+
+/** `at` is when a project was last used: eviction lets go of the oldest first. */
+type Sizes = { user: Bytes; projects: Record<string, { at: number; bytes: Bytes }> }
+
 /** Where new labels go, by the person's say: this project's, unless they said otherwise. */
 const LEARNING_KEY = 'learn'
-/** When each project with labels was last opened, so labels of a project long left can go. */
-const PROJECTS_KEY = 'projects'
-const STALE_MS = 90 * 24 * 60 * 60 * 1000
+/** Every write records its key's size here, so a start reads this one key, not every label. */
+const SIZES_KEY = 'sizes'
+// Half the store's 4 MiB, so the scopes in use can still grow before the next start trims them.
+const BUDGET_BYTES = 2 * 1024 * 1024
+
+const SCOPES: readonly Scope[] = ['local', 'user']
+const KINDS: readonly Kind[] = ['examples', ...JUDGES.flatMap((by): Kind[] => [`lessons:${by}`, `calls:${by}`])]
+// A long session judges without writing; it is still a project in use, never the one evicted.
+const USE_MS = 60 * 60 * 1000
 
 const localKey = (root: string, kind: Kind): string => `local:${root}:${kind}`
+
+const bytesIn = (bytes: Bytes): number => Object.values(bytes).reduce<number>((t, n) => t + (n ?? 0), 0)
+
+/** `bytes` with `kind` at `n`, or without `kind` once it holds nothing. */
+function sized(bytes: Bytes, kind: Kind, n: number): Bytes {
+  const next = { ...bytes }
+  if (n === 0) delete next[kind]
+  else next[kind] = n
+
+  return next
+}
+
+/** The store write under way. A write that reads first waits for it: two at once would each write back what the other never saw. */
+let writing: Promise<unknown> = Promise.resolve()
+
+/** Runs `work` once every write before it is done. Only the outermost write takes a turn: one inside another would wait on itself. */
+function serially<T>(work: () => Promise<T>): Promise<T> {
+  const turn = writing.then(work, work)
+  writing = turn.catch(() => undefined)
+
+  return turn
+}
 
 /**
  * Where a scope's labels and rules live in the plugin's own store, under the user's Claude
@@ -537,68 +595,150 @@ async function lessonsAt($: EngineInterface, key: string): Promise<Lessons | und
   return typeof kept?.text === 'string' && typeof kept.upTo === 'number' ? { text: kept.text, upTo: kept.upTo } : undefined
 }
 
-/** A scope's labels and each judge's rules. */
-async function readScope($: EngineInterface, scope: Scope): Promise<Kept> {
-  const lessons: Partial<Record<Judging, Lessons>> = {}
-  for (const by of JUDGES) {
-    const drawn = await lessonsAt($, await keyOf($, scope, `lessons:${by}`))
-    if (drawn !== undefined) lessons[by] = drawn
-  }
+async function calibrationAt($: EngineInterface, scope: Scope, by: Judging): Promise<Calibration> {
+  const kept = await $.store.get(await keyOf($, scope, `calls:${by}`))
 
-  return { examples: await examplesAt($, await keyOf($, scope, 'examples')), lessons }
+  return typeof kept === 'object' && kept !== null && !Array.isArray(kept) ? (kept as Calibration) : {}
+}
+
+async function readScope($: EngineInterface, scope: Scope): Promise<Kept> {
+  const [examples, drawn] = await Promise.all([
+    keyOf($, scope, 'examples').then(key => examplesAt($, key)),
+    Promise.all(JUDGES.map(by => keyOf($, scope, `lessons:${by}`).then(key => lessonsAt($, key)))),
+  ])
+  const lessons: Partial<Record<Judging, Lessons>> = {}
+  JUDGES.forEach((by, i) => {
+    const one = drawn[i]
+    if (one !== undefined) lessons[by] = one
+  })
+
+  return { examples, lessons }
+}
+
+async function readSizes($: EngineInterface): Promise<Sizes> {
+  const kept = (await $.store.get(SIZES_KEY)) as Partial<Sizes> | undefined
+
+  return { user: kept?.user ?? {}, projects: kept?.projects ?? {} }
+}
+
+/**
+ * Records how large one of a scope's keys is now, and that a project written to is in use.
+ * A size that cannot be recorded leaves the record behind, never the label.
+ */
+async function measure($: EngineInterface, scope: Scope, kind: Kind, bytes: number): Promise<void> {
+  try {
+    const sizes = await readSizes($)
+    if (scope === 'user') {
+      sizes.user = sized(sizes.user, kind, bytes)
+    } else {
+      const root = await $.session.root()
+      sizes.projects[root] = { at: await $.clock.now(), bytes: sized(sizes.projects[root]?.bytes ?? {}, kind, bytes) }
+    }
+    await $.store.set(SIZES_KEY, sizes)
+  } catch {
+    // The record catches up at the scope's next write.
+  }
+}
+
+/** Every label write goes through `put` or `drop`, so a start reads `sizes` alone, never every label. */
+async function put($: EngineInterface, scope: Scope, kind: Kind, value: unknown): Promise<void> {
+  await $.store.set(await keyOf($, scope, kind), value)
+  await measure($, scope, kind, sizeOf(value))
+}
+
+async function drop($: EngineInterface, scope: Scope, kind: Kind): Promise<void> {
+  await $.store.delete(await keyOf($, scope, kind))
+  await measure($, scope, kind, 0)
 }
 
 /** Keeps a label in `scope`, trimming the scope to its limit; resolves with what the scope keeps now. */
-async function learn($: EngineInterface, scope: Scope, example: Example): Promise<Example[]> {
-  const key = await keyOf($, scope, 'examples')
-  const examples = keep([...(await examplesAt($, key)), example], LIMITS[scope])
-  await $.store.set(key, examples)
+function learn($: EngineInterface, scope: Scope, example: Example): Promise<Example[]> {
+  return serially(async () => {
+    const examples = keep([...(await examplesAt($, await keyOf($, scope, 'examples'))), example], LIMITS[scope])
+    await put($, scope, 'examples', examples)
 
-  return examples
+    return examples
+  })
 }
 
 const isOne = (x: Example, one: Pick<Example, 'at' | 'prompt'>): boolean => x.at === one.at && x.prompt === one.prompt
 
 /** Drops the label `scope` keeps for one prompt, named by when it was typed and what it said. */
-async function unlearn($: EngineInterface, scope: Scope, one: Pick<Example, 'at' | 'prompt'>): Promise<void> {
-  const key = await keyOf($, scope, 'examples')
-
-  await $.store.set(key, (await examplesAt($, key)).filter(x => !isOne(x, one)))
+function unlearn($: EngineInterface, scope: Scope, one: Pick<Example, 'at' | 'prompt'>): Promise<void> {
+  return serially(async () => {
+    await put($, scope, 'examples', (await examplesAt($, await keyOf($, scope, 'examples'))).filter(x => !isOne(x, one)))
+  })
 }
 
 /** Rewrites the label `scope` keeps for one prompt; resolves with what the scope keeps now. */
-async function relearn(
+function relearn(
   $: EngineInterface,
   scope: Scope,
   one: Pick<Example, 'at' | 'prompt'>,
   change: (x: Example) => Example,
 ): Promise<Example[]> {
-  const key = await keyOf($, scope, 'examples')
-  const examples = (await examplesAt($, key)).map(x => (isOne(x, one) ? change(x) : x))
-  await $.store.set(key, examples)
+  return serially(async () => {
+    const examples = (await examplesAt($, await keyOf($, scope, 'examples'))).map(x => (isOne(x, one) ? change(x) : x))
+    await put($, scope, 'examples', examples)
 
-  return examples
+    return examples
+  })
 }
 
-async function keepLessons($: EngineInterface, scope: Scope, by: Judging, lessons: Lessons): Promise<void> {
-  await $.store.set(await keyOf($, scope, `lessons:${by}`), lessons)
+function keepLessons($: EngineInterface, scope: Scope, by: Judging, lessons: Lessons): Promise<void> {
+  return serially(() => put($, scope, `lessons:${by}`, lessons))
 }
 
-/** Forgets a scope's labels and every judge's rules. */
-async function forget($: EngineInterface, scope: Scope): Promise<void> {
-  await $.store.delete(await keyOf($, scope, 'examples'))
-  for (const by of JUDGES) await $.store.delete(await keyOf($, scope, `lessons:${by}`))
+/** Forgets a scope's labels, and every judge's rules and tally. */
+function forget($: EngineInterface, scope: Scope): Promise<void> {
+  return serially(async () => {
+    await drop($, scope, 'examples')
+    for (const by of JUDGES) {
+      await drop($, scope, `lessons:${by}`)
+      await drop($, scope, `calls:${by}`)
+    }
+  })
 }
 
-/** Copies this project's labels to every project's, leaving out any already there; resolves with how many. */
-async function promote($: EngineInterface): Promise<{ copied: number; examples: Example[] }> {
-  const key = await keyOf($, 'user', 'examples')
-  const everyone = await examplesAt($, key)
-  const fresh = (await readScope($, 'local')).examples.filter(x => !everyone.some(o => isOne(o, x)))
-  const examples = keep([...everyone, ...fresh].sort((a, b) => a.at - b.at), LIMITS.user)
-  await $.store.set(key, examples)
+/** Copies this project's labels to every project's, leaving out any already there; resolves with how many. Tallies stay where they are. */
+function promote($: EngineInterface): Promise<{ copied: number; examples: Example[] }> {
+  return serially(async () => {
+    const everyone = await examplesAt($, await keyOf($, 'user', 'examples'))
+    const fresh = (await readScope($, 'local')).examples.filter(x => !everyone.some(o => isOne(o, x)))
+    const examples = keep([...everyone, ...fresh].sort((a, b) => a.at - b.at), LIMITS.user)
+    await put($, 'user', 'examples', examples)
 
-  return { copied: fresh.length, examples }
+    return { copied: fresh.length, examples }
+  })
+}
+
+/** Counts a pop-up answer in the tally of the scope its label is kept in, and against any range `was` reopened, in either scope. */
+function countAnswer($: EngineInterface, kept: Scope | null, by: Judging, verdict: Interrupting, sure: number, isRight: boolean): Promise<void> {
+  return serially(async () => {
+    for (const scope of SCOPES) {
+      const before = await calibrationAt($, scope, by)
+      const after = answeredIn(before, verdict, sure, isRight, scope === kept)
+      if (after !== before) await put($, scope, `calls:${by}`, after)
+    }
+  })
+}
+
+/** Moves a pop-up answer `was` turned around to the other count of its tally. */
+function recount($: EngineInterface, scope: Scope, by: Judging, verdict: Interrupting, sure: number, isRight: boolean): Promise<void> {
+  return serially(async () => {
+    await put($, scope, `calls:${by}`, recountedIn(await calibrationAt($, scope, by), verdict, sure, isRight))
+  })
+}
+
+/** Reopens the bar down to a right call it held back, in the scope the correction is kept in. */
+function reopen($: EngineInterface, scope: Scope, by: Judging, verdict: Interrupting, sure: number): Promise<void> {
+  return serially(async () => {
+    const here = await calibrationAt($, 'local', by)
+    const everywhere = await calibrationAt($, 'user', by)
+    const before = scope === 'local' ? here : everywhere
+    const after = reopenedIn(before, verdict, sure, barsFor([here, everywhere], by)[verdict])
+    if (after !== before) await put($, scope, `calls:${by}`, after)
+  })
 }
 
 async function learning($: EngineInterface): Promise<Learning> {
@@ -611,32 +751,50 @@ async function learnInto($: EngineInterface, where: Learning): Promise<void> {
   await $.store.set(LEARNING_KEY, where)
 }
 
-/** The project a store key belongs to, or undefined for a key of every project's. */
-const rootOf = (key: string): string | undefined => /^local:(.+):(?:examples|lessons:\w+)$/.exec(key)?.[1]
+let usedAt = -Infinity
+
+async function use($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  if (now - usedAt < USE_MS) return
+
+  usedAt = now
+  await serially(async () => {
+    const sizes = await readSizes($)
+    const here = await $.session.root()
+    sizes.projects[here] = { at: now, bytes: sizes.projects[here]?.bytes ?? {} }
+    await $.store.set(SIZES_KEY, sizes)
+  })
+}
 
 /**
- * Marks this project as opened now, and lets go of the labels and rules of every project
- * nobody has opened for `STALE_MS`: the store is one file of at most 4 MiB for them all.
- * A project with labels from before this was kept is taken as opened now.
+ * Marks this project in use and, while every scope's labels, rules and tallies together pass
+ * `BUDGET_BYTES`, lets go of those of the projects used longest ago, never this one's: the
+ * store is one file of at most 4 MiB for them all. A project with nothing kept leaves the
+ * record. Every kind is deleted, recorded or not, so no key outlives its record.
  */
-async function visit($: EngineInterface): Promise<void> {
-  const now = await $.clock.now()
-  const kept = (await $.store.get(PROJECTS_KEY)) as Record<string, number> | undefined
-  const opened: Record<string, number> = { ...kept }
-  const keys = await $.store.keys()
+function visit($: EngineInterface): Promise<void> {
+  return serially(async () => {
+    const now = await $.clock.now()
+    usedAt = now
+    const here = await $.session.root()
+    const sizes = await readSizes($)
+    sizes.projects[here] = { at: now, bytes: sizes.projects[here]?.bytes ?? {} }
 
-  for (const key of keys) {
-    const root = rootOf(key)
-    if (root !== undefined && opened[root] === undefined) opened[root] = now
-  }
-  for (const [root, at] of Object.entries(opened)) {
-    if (now - at <= STALE_MS) continue
-    for (const key of keys) if (rootOf(key) === root) await $.store.delete(key)
-    delete opened[root]
-  }
-  opened[await $.session.root()] = now
+    let stored = Object.values(sizes.projects).reduce((t, p) => t + bytesIn(p.bytes), bytesIn(sizes.user))
+    const others = Object.entries(sizes.projects)
+      .filter(([root]) => root !== here)
+      .sort(([, a], [, b]) => a.at - b.at)
+    for (const [root, { bytes }] of others) {
+      const size = bytesIn(bytes)
+      if (size > 0 && stored <= BUDGET_BYTES) continue
 
-  await $.store.set(PROJECTS_KEY, opened)
+      for (const kind of KINDS) await $.store.delete(localKey(root, kind))
+      delete sizes.projects[root]
+      stored -= size
+    }
+
+    await $.store.set(SIZES_KEY, sizes)
+  })
 }
 
 // Judges: kept here, not in their own module, for compatibility with 2.1.295 (see Labels above).
@@ -656,7 +814,7 @@ const JEV_URL = 'https://api.typesafe.ai/v1/systemone'
 const LESSONS_TIMEOUT_MS = 60_000
 const LESSONS_TOKENS = 800
 
-async function judgeWithHaiku($: EngineInterface, beats: Beat[], text: string, t: Teaching): Promise<Judgement> {
+async function judgeWithHaiku($: EngineInterface, beats: Beat[], text: string, t: Teaching): Promise<Judgment> {
   const { system, prompt } = haikuRequest(beats, text, t)
   let r: ModelCompleteResult
   try {
@@ -684,9 +842,12 @@ async function judgeWithHaiku($: EngineInterface, beats: Beat[], text: string, t
   )
 }
 
-async function judgeWithJev($: EngineInterface, beats: Beat[], text: string, t: Teaching): Promise<Judgement> {
+// An empty `TYPESAFE_API_KEY` would be sent as `Bearer ` and refused like a bad key; it is no key at all.
+const isKey = (key: string | undefined): key is string => key !== undefined && key.trim() !== ''
+
+async function judgeWithJev($: EngineInterface, beats: Beat[], text: string, t: Teaching): Promise<Judgment> {
   const key = await $.env.get('TYPESAFE_API_KEY')
-  if (key === undefined) return failed('Jev has no key: `TYPESAFE_API_KEY` is not set where Claude Code started')
+  if (!isKey(key)) return failed('Jev has no key: `TYPESAFE_API_KEY` is unset or empty where Claude Code started')
 
   const call = $.http
     .fetch(JEV_URL, {
@@ -696,7 +857,7 @@ async function judgeWithJev($: EngineInterface, beats: Beat[], text: string, t: 
     })
     .catch((e: unknown) => failed(`Jev could not be reached: ${messageOf(e)}`))
   // $.http.fetch takes no timeout or signal, so the judge stops waiting instead.
-  const late = new Promise<Judgement>(resolve =>
+  const late = new Promise<Judgment>(resolve =>
     $.clock.after(JEV_TIMEOUT_MS, () => resolve(failed(`Jev did not answer within ${JEV_TIMEOUT_MS / 1000}s`))),
   )
   const r = await Promise.race([call, late])
@@ -716,14 +877,14 @@ function judgeWith(
   beats: Beat[],
   text: string,
   t: Teaching,
-): Promise<Judgement> {
+): Promise<Judgment> {
   return by === 'jev' ? judgeWithJev($, beats, text, t) : judgeWithHaiku($, beats, text, t)
 }
 
 /**
  * Has Claude Haiku say why a verdict was given and how the prompt compared with its
  * session, whichever judge gave the verdict: the teaching is in its words either way.
- * `medium`: a few requests a session, and every later judgement reads what they write.
+ * `medium`: a few requests a session, and every later judgment reads what they write.
  * Resolves undefined when it gave no comparison or could not be asked.
  */
 async function explainVerdict(
@@ -750,7 +911,7 @@ async function explainVerdict(
 
 /**
  * Draws one judge's rules for a scope again from its labels, with Claude Sonnet: a rare
- * call, and one whose rules every later judgement reads, so it runs at Sonnet's own
+ * call, and one whose rules every later judgment reads, so it runs at Sonnet's own
  * `high`. Resolves with the rules, or empty when the model gave none or could not be asked.
  */
 async function drawLessons(
@@ -795,7 +956,7 @@ export const register: Register = on => {
     try {
       await visit($)
     } catch {
-      // Labels of a project long left stay a while longer.
+      // The store is trimmed at the next start instead.
     }
 
     return next(e)
@@ -828,7 +989,7 @@ export const register: Register = on => {
     const want = arg === 'on' ? 'haiku' : arg
 
     if (want === 'off' || want === 'haiku' || want === 'jev') {
-      if (want === 'jev' && (await $.env.get('TYPESAFE_API_KEY')) === undefined) return { text: NO_KEY }
+      if (want === 'jev' && !isKey(await $.env.get('TYPESAFE_API_KEY'))) return { text: NO_KEY }
       await update($, judge, () => want)
 
       return { text: SAID[want] }

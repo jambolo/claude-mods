@@ -1,4 +1,4 @@
-import type { Beat, Call, Example, Judge, Judgement, Scope, Truth, Verdict, Who } from '../types'
+import type { Beat, Call, Example, Judge, Judgment, Scope, Truth, Verdict, Who } from '../types'
 
 /** The session record starts empty. */
 export const EMPTY: Beat[] = []
@@ -38,10 +38,10 @@ export const MEANINGS: Record<Verdict, string> = {
 export const VERDICTS = Object.keys(MEANINGS) as Verdict[]
 
 /** What an answer nobody can read comes to: it is no reason to interrupt. */
-export const NO_VERDICT: Judgement = { verdict: 'same', reason: '' }
+export const NO_VERDICT: Judgment = { verdict: 'same', reason: '' }
 
 /** A judge that gave no answer, and why: the prompt goes through unjudged. */
-export const failed = (failure: string): Judgement => ({ ...NO_VERDICT, failure })
+export const failed = (failure: string): Judgment => ({ ...NO_VERDICT, failure })
 
 /** The judge's own call, with only the parts it gave: what is kept holds no `undefined`. */
 export const callOf = (j: Call): Call => ({
@@ -116,7 +116,7 @@ export function hasSubject(text: string): boolean {
 }
 
 /**
- * Whether a prompt is worth a judgement. The first prompt of a session has
+ * Whether a prompt is worth a judgment. The first prompt of a session has
  * nothing to be unrelated to, a line meant for the composer is no prompt at all,
  * a bare answer or nudge carries no subject, and a prompt typed again is a retry
  * of the one before it.
@@ -124,18 +124,21 @@ export function hasSubject(text: string): boolean {
 export function isWorthJudging(text: string, log: Beat[]): boolean {
   const before = lastAsked(log)
 
-  return hasSubject(text) && before !== undefined && before !== squash(text)
+  // The record keeps a prompt clipped, so a long one typed again is compared clipped too.
+  return hasSubject(text) && before !== undefined && before !== promptOf(text)
 }
+
+/** Whether the record has let go of the session's first prompt. */
+const hasLetGo = (log: Beat[], anchor: Beat | null): anchor is Beat =>
+  anchor !== null && !log.some(b => b.who === anchor.who && b.text === anchor.text)
 
 /**
  * The session and the new prompt, as material for the judge, opening with the session's
  * first prompt once its record has let go of it. All of it is data, never instructions.
  */
 export function briefing(log: Beat[], text: string, anchor: Beat | null = null): string {
-  const isKept = anchor === null || log.some(b => b.who === anchor.who && b.text === anchor.text)
-
   return [
-    ...(isKept ? [] : ['The session began with:', '<start>', ...linesOf([anchor]), '</start>']),
+    ...(hasLetGo(log, anchor) ? ['The session began with:', '<start>', ...linesOf([anchor]), '</start>'] : []),
     'The session so far, oldest line first:',
     '<session>',
     ...linesOf(log),
@@ -149,18 +152,26 @@ export function briefing(log: Beat[], text: string, anchor: Beat | null = null):
 
 /** The session as the judge saw it: its last lines, opening with its first prompt once they have let go of it. */
 export function sessionOf(log: Beat[], anchor: Beat | null): Beat[] {
-  const isKept = anchor === null || log.some(b => b.who === anchor.who && b.text === anchor.text)
+  return hasLetGo(log, anchor) ? [anchor, ...log] : log
+}
 
-  return isKept ? log : [anchor, ...log]
+/**
+ * How sure a number the judge gave says it was. It is asked for 0 to 100, but one with a
+ * point and no more than 1, with no `%`, is read as already a fraction: `0.8` is 80%.
+ */
+function sureOf(number: string, isPercent: boolean): number {
+  const n = Number(number)
+
+  return number.includes('.') && n <= 1 && !isPercent ? n : n / 100
 }
 
 /**
  * The judge's one word, how sure of it it was, and its few words of reason, on its first
  * line; on a second, for `aside` or `phase`, a sentence comparing the prompt with the
- * session. Anything unreadable is taken as `same`; a judgement without a number in it is
+ * session. Anything unreadable is taken as `same`; a judgment without a number in it is
  * not gated.
  */
-export function readVerdict(answer: string): Judgement {
+export function readVerdict(answer: string): Judgment {
   const [first = '', ...rest] = answer.trim().split(/\r?\n/)
   const said = squash(first)
   const verdict = VERDICTS.find(v => said.toLowerCase().startsWith(v))
@@ -168,8 +179,8 @@ export function readVerdict(answer: string): Judgement {
   if (verdict === undefined) return NO_VERDICT
 
   const after = said.slice(verdict.length)
-  const number = /^\s*(\d{1,3})\s*%?/.exec(after)
-  const sure = number === null ? NaN : Number(number[1]) / 100
+  const number = /^\s*(\d{1,3}(?:\.\d+)?)\s*(%?)/.exec(after)
+  const sure = number === null ? NaN : sureOf(number[1] ?? '', number[2] === '%')
   const comparison = verdict === 'same' ? '' : comparisonOf(rest.join(' '))
 
   return {
@@ -181,13 +192,16 @@ export function readVerdict(answer: string): Judgement {
   }
 }
 
-type JevAnswer = { choice?: unknown; probabilities?: Record<string, unknown> }
+type JevAnswer = { choice?: unknown; probabilities?: Record<string, unknown>; confidence?: unknown }
+
+const isFraction = (n: unknown): n is number => typeof n === 'number' && n >= 0 && n <= 1
 
 /**
- * Jev's pick and how sure it was. Jev answers in a fixed shape, so a body without a
- * verdict in it is a failure.
+ * Jev's pick and how sure it was: the pick's probability, else Jev's confidence. Jev
+ * answers in a fixed shape, so a body without both a verdict and how sure it was is a
+ * failure; read as 0% sure, it would hold back every interruption without a word.
  */
-export function readJev(body: string): Judgement {
+export function readJev(body: string): Judgment {
   let answer: JevAnswer | undefined
   try {
     answer = (JSON.parse(body) as { answers?: { belongs?: JevAnswer } }).answers?.belongs
@@ -199,9 +213,10 @@ export function readJev(body: string): Judgement {
   const verdict = VERDICTS.find(v => v === choice)
   if (verdict === undefined) return failed("Jev's answer could not be read")
 
-  const p = answer?.probabilities?.[choice]
+  const sure = [answer?.probabilities?.[choice], answer?.confidence].find(isFraction)
+  if (sure === undefined) return failed("Jev's answer did not say how sure it was")
 
-  return { verdict, reason: '', pick: verdict, sure: typeof p === 'number' ? p : 0 }
+  return { verdict, reason: '', pick: verdict, sure }
 }
 
 /** Why Jev refused a request: its status, and the kind of error its body names, when it names one. */
@@ -251,13 +266,15 @@ export function bearsOut(truth: Truth, verdict: Verdict): boolean | undefined {
   return truth.not === verdict ? false : undefined
 }
 
-/** Whether the verdict the mod acted on was wrong: the judge's own mistake, which teaches it most. */
-export const isMistake = (x: Example): boolean => bearsOut(x.truth, x.said) === false
+/**
+ * Whether the judge's own call was wrong, which teaches it most. Its `pick`, not `said`: a
+ * right call the bar held back is the bar's mistake, and the bar learns from its tally.
+ */
+export const isMistake = (x: Example): boolean => bearsOut(x.truth, x.pick ?? x.said) === false
 
 /** The verdict a label speaks of: the one the person gave, or the one they turned down. */
 export const spokenOf = (truth: Truth): Verdict => ('is' in truth ? truth.is : truth.not)
 
-/** The most labels each scope keeps. */
 export const LIMITS: Record<Scope, number> = { user: 500, local: 100 }
 
 const SCOPES = Object.keys(LIMITS) as Scope[]
@@ -274,6 +291,17 @@ export function keep(examples: Example[], cap: number): Example[] {
   const left = examples.filter(x => !agreeing.includes(x))
 
   return left.slice(left.length - cap)
+}
+
+/** The bytes a value takes in the store: its JSON as UTF-8, never fewer than the store counts. */
+export function sizeOf(value: unknown): number {
+  let bytes = 0
+  for (const ch of JSON.stringify(value) ?? '') {
+    const code = ch.codePointAt(0) ?? 0
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4
+  }
+
+  return bytes
 }
 
 /** A scope by its word, or undefined for any other word. */
@@ -306,14 +334,14 @@ const because = (reason: string): string => (reason === '' ? '' : `: ${reason}`)
 export const percent = (sure: number): string => `${Math.round(sure * 100)}%`
 
 /** How sure the judge was, and of what when that is not the verdict the mod acted on. */
-function howSure(j: Judgement): string {
+function howSure(j: Judgment): string {
   if (j.sure === undefined) return ''
 
   return j.pick !== undefined && j.pick !== j.verdict ? ` (${percent(j.sure)} sure of ${j.pick})` : ` (${percent(j.sure)} sure)`
 }
 
 /** What `/change-of-subject` prints. */
-export function report(judge: Judge, judged: number, last: Judgement | null, log: Beat[]): string {
+export function report(judge: Judge, judged: number, last: Judgment | null, log: Beat[]): string {
   const watch =
     judge === 'off'
       ? 'Not watching. `/change-of-subject on` starts it again.'

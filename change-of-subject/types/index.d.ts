@@ -27,7 +27,7 @@ export type Call = { pick?: Verdict; sure?: number }
  * no answer at all says why in `failure`, and its verdict is `same`: the prompt goes
  * through unjudged.
  */
-export type Judgement = Call & { verdict: Verdict; reason: string; comparison?: string; failure?: string }
+export type Judgment = Call & { verdict: Verdict; reason: string; comparison?: string; failure?: string }
 
 /** Where a label is kept: for every project (`user`), or for this one only (`local`). */
 export type Scope = 'user' | 'local'
@@ -64,6 +64,21 @@ export type Example = Call & {
 /** The rules a scope's labels came to for one judge, and the newest label they were drawn from. */
 export type Lessons = { text: string; upTo: number }
 
+export type Interrupting = Exclude<Verdict, 'same'>
+
+/**
+ * A judge's pop-up answers on one verdict, right and wrong, by how sure it was in 5% steps.
+ * Kept apart from the labels: trimming those keeps mistakes longest, which would skew it.
+ */
+export type Tally = {
+  right: number[]
+  wrong: number[]
+  /** Where `was` showed the bar hid right calls: those interrupt again until `left` more are answered. */
+  reopened?: { from: number; below: number; left: number }
+}
+
+export type Calibration = Partial<Record<Interrupting, Tally>>
+
 /** What the judge is taught for one prompt: the session's first prompt, past calls, and the person's rules. */
 export type Teaching = { anchor: Beat | null; examples: Example[]; lessons: string[] }
 
@@ -90,7 +105,7 @@ declare module 'claude-code' {
       /** The session's first prompt with a subject, which the record of its last lines lets go of. */
       anchor: Beat | null
       judge: Judge
-      last: Judgement | null
+      last: Judgment | null
       judged: number
       ruling: Ruling | null
     }

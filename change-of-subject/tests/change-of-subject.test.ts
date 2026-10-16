@@ -13,6 +13,7 @@ import {
   bearsOut,
   beatOf,
   briefing,
+  isMistake,
   isWorthJudging,
   jevRefused,
   keep,
@@ -22,9 +23,11 @@ import {
   readWas,
   remember,
   report,
+  sizeOf,
 } from '../hooks/model'
 import {
   EXPLAIN_SYSTEM,
+  answeredIn,
   barsFor,
   calibrated,
   gate,
@@ -35,8 +38,10 @@ import {
   pastCalls,
   readExplanation,
   readLessons,
+  recountedIn,
+  reopenedIn,
 } from '../hooks/teach'
-import type { Example, Truth, Verdict } from '../types'
+import type { Calibration, Example, Truth, Verdict } from '../types'
 
 const SESSION = { cwd: 'C:/repo', surface: 'terminal' as const, isInteractive: true }
 // Where the store keeps this project's labels, and everyone's.
@@ -84,6 +89,11 @@ type World = {
   toasts: string[]
   /** The plugin's store, by key. */
   store: Record<string, unknown>
+  /** The store keys read, in order. */
+  reads: string[]
+  /** Which reads the store holds until the test lets them go, as a slow disk or another session would. */
+  holdsRead: (key: string) => boolean
+  heldReads: (() => void)[]
   /** A store that refuses every write, as a full disk would. */
   isStoreBroken: boolean
   /** The system prompts Claude Haiku was judged with, one per prompt it was asked about. */
@@ -119,6 +129,21 @@ const labeled = (prompt: string, said: Verdict, more: Partial<Example> = {}): Ex
 // Where the store keeps Claude Haiku's rules for this project, and for every project.
 const HERE_LESSONS = 'local:C:/repo:lessons:haiku'
 const EVERYWHERE_LESSONS = 'user:lessons:haiku'
+// Where the store keeps the tally of Claude Haiku's answered calls for this project.
+const HERE_CALLS = 'local:C:/repo:calls:haiku'
+
+/** A tally of answered `aside` calls, each `[sure, isRight]`, as the store keeps one. */
+const tallied = (calls: [number, boolean][], into: Calibration = {}): Calibration =>
+  calls.reduce((c, [sure, isRight]) => answeredIn(c, 'aside', sure, isRight, true), into)
+
+/** Twenty answered calls that set the `aside` bar at 90%: most at 60% were wrong, all at 90% right. */
+const BAR_AT_90: [number, boolean][] = [
+  ...Array.from({ length: 10 }, (_, i): [number, boolean] => [0.6, i < 2]),
+  ...Array.from({ length: 10 }, (): [number, boolean] => [0.9, true]),
+]
+
+/** What the store's tally of Claude Haiku's calls for this project holds now. */
+const tallyHere = (w: World): Calibration => (w.store[HERE_CALLS] ?? {}) as Calibration
 // What Claude Haiku says, unless the test queued another explanation.
 const EXPLAINED = 'off the subject of the parser\nThe session is writing a config parser; the prompt asks about something else.'
 
@@ -140,6 +165,9 @@ function worldOf(on: On): World {
     fetched: [],
     toasts: [],
     store: {},
+    reads: [],
+    holdsRead: () => false,
+    heldReads: [],
     isStoreBroken: false,
     systems: [],
     lessons: [],
@@ -151,7 +179,13 @@ function worldOf(on: On): World {
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.root', () => ({ value: 'C:/repo' }))
 
-  on('store.get', ($, e) => ({ value: w.store[e.key] }))
+  on('store.get', async ($, e) => {
+    w.reads.push(e.key)
+    const value = w.store[e.key]
+    if (w.holdsRead(e.key)) await new Promise<void>(go => w.heldReads.push(go))
+
+    return { value }
+  })
   on('store.set', ($, e) => {
     if (w.isStoreBroken) throw new Error('disk full')
     w.store[e.key] = JSON.parse(JSON.stringify(e.value)) as unknown
@@ -986,17 +1020,14 @@ test('a store that keeps nothing costs nobody their prompt or their choice', asy
 })
 
 test('the bar for a verdict is the lowest sureness at which the judge is right often enough', () => {
-  const call = (sure: number, isRight: boolean): Example =>
-    labeled('a prompt', 'aside', { pick: 'aside', sure, truth: isRight ? { is: 'aside' } : { not: 'aside' } })
-  const doubtful = Array.from({ length: 10 }, (_, i) => call(0.5, i < 2))
-  const sure = Array.from({ length: 10 }, (_, i) => call(0.9, i < 9))
+  const doubtful = Array.from({ length: 10 }, (_, i): [number, boolean] => [0.5, i < 2])
+  const sure = Array.from({ length: 10 }, (_, i): [number, boolean] => [0.9, i < 9])
 
-  expect(calibrated([...doubtful, ...sure], 'haiku', 'aside')).toBe(0.9)
-  expect(calibrated([...doubtful, ...sure.slice(1)], 'haiku', 'aside'), 'too few calls to say').toBe(undefined)
-  expect(calibrated([...doubtful, ...doubtful], 'haiku', 'aside'), 'never right enough').toBe(0.95)
-  expect(calibrated([...doubtful, ...sure], 'jev', 'aside'), "another judge's calls say nothing").toBe(undefined)
+  expect(calibrated(tallied([...doubtful, ...sure]).aside)).toBe(0.9)
+  expect(calibrated(tallied([...doubtful, ...sure.slice(1)]).aside), 'too few calls to say').toBe(undefined)
+  expect(calibrated(tallied([...doubtful, ...doubtful]).aside), 'never right enough').toBe(0.95)
 
-  const bars = barsFor([doubtful, [...doubtful, ...sure]], 'haiku')
+  const bars = barsFor([tallied(doubtful), tallied([...doubtful, ...sure])], 'haiku')
   expect(bars, 'from the first scope with calls enough').toEqual({ aside: 0.9, phase: 0 })
   expect(gate({ verdict: 'aside', reason: '', pick: 'aside', sure: 0.85 }, bars).verdict).toBe('same')
   expect(gate({ verdict: 'aside', reason: '', pick: 'aside', sure: 0.9 }, bars).verdict).toBe('aside')
@@ -1122,7 +1153,7 @@ test("Claude Haiku is shown the person's past calls and its rules from every sco
   expect(w.systems[0], "another judge's rules").not.toContain('Only for Jev')
 })
 
-test('Jev is shown past calls from this project only', async ($, on) => {
+test('Jev is shown past calls and rules from every scope, as Claude Haiku is', async ($, on) => {
   const w = worldOf(on)
   mock.clock(on, { now: 1_000 })
   w.env = { TYPESAFE_API_KEY: 'sk-test' }
@@ -1137,16 +1168,14 @@ test('Jev is shown past calls from this project only', async ($, on) => {
 
   const body = String(w.fetched[0]?.init?.body)
   expect(body).toContain('write the docs for the parser')
-  expect(body, "another project's prompts never go to TypeSafe").not.toContain('docs for the parser flags')
-  expect(body, 'rules quote no prompt, so every scope sends them').toContain('Geography is aside.')
+  expect(body, 'labels kept for every project go too').toContain('docs for the parser flags')
+  expect(body).toContain('Geography is aside.')
 })
 
-test('a call the labels say is too doubtful to trust carries on without a pop-up', async ($, on) => {
+test('a call the tally says is too doubtful to trust carries on without a pop-up', async ($, on) => {
   const w = worldOf(on)
   mock.clock(on, { now: 1_000 })
-  const call = (sure: number, isRight: boolean): Example =>
-    labeled('a prompt', 'aside', { pick: 'aside', sure, truth: isRight ? { is: 'aside' } : { not: 'aside' } })
-  w.store[HERE] = [...Array.from({ length: 10 }, (_, i) => call(0.6, i < 2)), ...Array.from({ length: 10 }, () => call(0.9, true))]
+  w.store[HERE_CALLS] = tallied(BAR_AT_90)
   w.verdicts = ['aside 60: a question about Peru', 'aside 95: a question about Chile']
   w.answers = [CARRY_ON_HERE]
 
@@ -1290,25 +1319,261 @@ test("promote copies this project's labels to every project's, and forget lets a
   expect(labelsIn(w, EVERYWHERE).length).toBe(2)
 })
 
-test('the labels of a project nobody has opened for 90 days are let go', async ($, on) => {
+test("a value's size in the store is its JSON as UTF-8", () => {
+  expect(sizeOf({ a: 1 })).toBe(7)
+  expect(sizeOf('é')).toBe(4)
+  expect(sizeOf('😀')).toBe(6)
+})
+
+test('once the labels pass 2 MiB, the projects opened longest ago let theirs go, never this one', async ($, on) => {
   const w = worldOf(on)
-  const DAY = 24 * 60 * 60 * 1000
-  mock.clock(on, { now: 100 * DAY })
-  w.store.projects = { 'C:/old': 5 * DAY, 'C:/recent': 50 * DAY }
+  const MiB = 1024 * 1024
+  mock.clock(on, { now: 1_000 })
+  w.store.sizes = {
+    user: { examples: 100_000 },
+    projects: {
+      'C:/repo': { at: 1, bytes: { examples: MiB / 2 } },
+      'C:/empty': { at: 2, bytes: {} },
+      'C:/old': { at: 5, bytes: { examples: MiB, 'lessons:haiku': 1_000 } },
+      'C:/recent': { at: 50, bytes: { examples: MiB / 2 } },
+    },
+  }
+  w.store[HERE] = [labeled('write the docs', 'same')]
   w.store['local:C:/old:examples'] = [labeled('order lunch', 'aside')]
   w.store['local:C:/old:lessons:haiku'] = { text: '- Lunch is aside.', upTo: 1 }
+  w.store['local:C:/old:calls:jev'] = {}
   w.store['local:C:/recent:examples'] = [labeled('order lunch', 'aside')]
-  w.store['local:C:/untracked:examples'] = [labeled('order lunch', 'aside')]
 
   await $.session.start(SESSION)
 
+  expect(w.reads, 'a start reads the record of sizes alone').toEqual(['sizes'])
   expect(w.store['local:C:/old:examples']).toBe(undefined)
   expect(w.store['local:C:/old:lessons:haiku']).toBe(undefined)
-  expect(w.store['local:C:/recent:examples']).toBeDefined()
-  expect(w.store['local:C:/untracked:examples'], 'labels kept before projects were tracked count as opened now').toBeDefined()
-  expect(w.store.projects).toEqual({ 'C:/recent': 50 * DAY, 'C:/untracked': 100 * DAY, 'C:/repo': 100 * DAY })
+  expect(w.store['local:C:/old:calls:jev'], 'a key the record never counted goes too').toBe(undefined)
+  expect(w.store['local:C:/recent:examples'], 'under the cap again, so kept').toBeDefined()
+  expect(w.store[HERE], 'opened longest ago, but it is this project').toBeDefined()
+  expect(w.store.sizes).toEqual({
+    user: { examples: 100_000 },
+    projects: {
+      'C:/repo': { at: 1_000, bytes: { examples: MiB / 2 } },
+      'C:/recent': { at: 50, bytes: { examples: MiB / 2 } },
+    },
+  })
 })
 
+test('every write records the size of what it wrote', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.verdicts = ['aside 90: Peru\nThe session is writing a parser; the prompt asks about Peru.']
+  w.answers = [NOT_ASIDE]
+  const sizes = () => w.store.sizes as { user: Record<string, number>; projects: Record<string, { bytes: Record<string, number> }> }
+
+  await $.session.start(SESSION)
+  await say($, 'write a parser for the config file')
+  await say($, 'what is the capital of Peru?')
+
+  expect(sizes().projects['C:/repo']?.bytes).toEqual({
+    examples: sizeOf(w.store[HERE]),
+    'calls:haiku': sizeOf(w.store[HERE_CALLS]),
+  })
+
+  await runCommand($, 'promote')
+  expect(sizes().user).toEqual({ examples: sizeOf(w.store[EVERYWHERE]) })
+
+  await runCommand($, 'forget local')
+  expect(sizes().projects['C:/repo']?.bytes).toEqual({})
+})
+
+test('once a tally is full, each new call shrinks the rest in proportion', () => {
+  const full = tallied(Array.from({ length: 100 }, (): [number, boolean] => [0.9, false]))
+  const after = tallied([[0.9, true]], full)
+  const total = (c: Calibration): number => [...(c.aside?.right ?? []), ...(c.aside?.wrong ?? [])].reduce((t, n) => t + n, 0)
+
+  expect(total(full)).toBe(100)
+  expect(Math.round(total(after) * 1e6) / 1e6, 'it never holds more than 100').toBe(100)
+  expect(after.aside?.right[18]).toBe(1)
+})
+
+test("a judge's mistake is its own call turned down, not a call the bar held back", () => {
+  const held = labeled('what is the capital of Peru?', 'same', { pick: 'aside', sure: 0.6, truth: { is: 'aside' }, source: 'was' })
+  const missed = labeled('what is the capital of Peru?', 'same', { pick: 'same', truth: { is: 'aside' }, source: 'was' })
+
+  expect(isMistake(held), 'the judge was right; the bar was wrong').toBe(false)
+  expect(isMistake(missed)).toBe(true)
+  expect(lessonsBrief([held], undefined, 'haiku')).toContain('<judged>aside</judged>\n<person>bore it out</person>')
+})
+
+test('was reopens a bar down to a right call it held back, until five answers from there are in', () => {
+  const c = tallied(BAR_AT_90)
+  expect(barsFor([c], 'haiku').aside).toBe(0.9)
+  expect(reopenedIn(c, 'aside', 0.95, 0.9), 'a call the bar let through was never held back').toBe(c)
+
+  let open = reopenedIn(c, 'aside', 0.65, 0.9)
+  expect(barsFor([open], 'haiku').aside).toBe(0.65)
+
+  open = answeredIn(open, 'aside', 0.95, true, true)
+  expect(open.aside?.reopened?.left, 'an answer above the range is no answer from it').toBe(5)
+  for (let i = 0; i < 4; i += 1) open = answeredIn(open, 'aside', 0.7, true, false)
+  expect(open.aside?.reopened?.left, 'answers from the range count, wherever they are kept').toBe(1)
+  open = answeredIn(open, 'aside', 0.7, false, false)
+
+  expect(open.aside?.reopened).toBe(undefined)
+  expect(barsFor([open], 'haiku').aside, 'and the tally decides again').toBe(0.9)
+})
+
+test('was that turns a pop-up answer around moves it to the other count', () => {
+  const turned = recountedIn(tallied([[0.9, false]]), 'aside', 0.9, true)
+
+  expect([turned.aside?.right[18], turned.aside?.wrong[18]]).toEqual([1, 0])
+  expect(recountedIn(turned, 'aside', 0.9, true), 'nothing left to move').toEqual(turned)
+})
+
+test('a pop-up answer is counted in the tally of the scope its label is kept in, and nowhere while labels are not kept', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.verdicts = [
+    'aside 90: Peru\nThe session is writing a parser; the prompt asks about Peru.',
+    'aside 80: Chile\nThe session is writing a parser; the prompt asks about Chile.',
+  ]
+  w.answers = [NOT_ASIDE, NOT_ASIDE]
+
+  await $.session.start(SESSION)
+  await say($, 'write a parser for the config file')
+  await say($, 'what is the capital of Peru?')
+  await runCommand($, 'learn off')
+  await say($, 'and the capital of Chile?')
+
+  expect(tallyHere(w).aside?.wrong[18]).toBe(1)
+  expect(tallyHere(w).aside?.wrong[16], 'learn off keeps no count').toBe(0)
+  expect(w.store['user:calls:haiku']).toBe(undefined)
+})
+
+test('was on a call the bar held back reopens the bar, and the next call there interrupts', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.store[HERE_CALLS] = tallied(BAR_AT_90)
+  w.verdicts = ['aside 60: a question about Peru', 'aside 65: a question about Chile\nThe session is writing a parser; the prompt asks about Chile.']
+  w.answers = [NOT_ASIDE]
+
+  await $.session.start(SESSION)
+  await say($, 'write a parser for the config file')
+  await say($, 'what is the capital of Peru?')
+  expect(w.questions, 'held back by the bar').toEqual([])
+
+  await runCommand($, 'was aside')
+  expect(tallyHere(w).aside?.reopened).toEqual({ from: 0.6, below: 0.9, left: 5 })
+  expect(JSON.stringify(await runCommand($, 'lessons local')), 'the judge was right').toContain("0 of them Claude Haiku's mistakes")
+
+  await say($, 'and the capital of Chile?')
+  expect(w.questions.length).toBe(1)
+  expect(tallyHere(w).aside?.reopened?.left).toBe(4)
+})
+
+test('was that turns a pop-up answer around moves its count in the tally', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.verdicts = ['aside 90: Chile\nThe session is writing a parser; the prompt asks about Chile.']
+  w.answers = [NOT_ASIDE]
+
+  await $.session.start(SESSION)
+  await say($, 'write a parser for the config file')
+  await say($, 'and the capital of Chile?')
+  expect(tallyHere(w).aside?.wrong[18]).toBe(1)
+
+  await runCommand($, 'was aside')
+  expect([tallyHere(w).aside?.right[18], tallyHere(w).aside?.wrong[18]]).toEqual([1, 0])
+})
+
+test('two writes to one scope at once keep both', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.store[HERE] = [labeled('write the docs', 'same')]
+  w.verdicts = ['aside 90: Peru\nThe session is writing a parser; the prompt asks about Peru.']
+  w.answers = [CARRY_ON_HERE]
+  // Long enough for a write not waiting its turn to reach the store.
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 500; i += 1) await Promise.resolve()
+  }
+
+  await $.session.start(SESSION)
+  await say($, 'write a parser for the config file')
+  await say($, 'what is the capital of Peru?')
+
+  w.holdsRead = key => key === EVERYWHERE
+  const promoting = runCommand($, 'promote')
+  const correcting = runCommand($, 'was aside user')
+  for (let i = 0; i < 50 && w.heldReads.length === 0; i += 1) await settle()
+  for (let i = 0; i < 10; i += 1) await settle()
+
+  expect(w.heldReads.length, 'the second write waits its turn instead of reading').toBe(1)
+  w.holdsRead = () => false
+  w.heldReads.splice(0).forEach(go => go())
+  await Promise.all([promoting, correcting])
+
+  expect(labelsIn(w, EVERYWHERE).map(x => x.prompt)).toEqual(['write the docs', 'what is the capital of Peru?'])
+})
+
+test('a sureness given as a fraction is read as one, and none of it is left in the reason', () => {
+  expect(readVerdict('aside 0.8: a question about tea')).toEqual({ verdict: 'aside', reason: 'a question about tea', pick: 'aside', sure: 0.8 })
+  expect(readVerdict('aside 85.5: a question about tea')).toEqual({ verdict: 'aside', reason: 'a question about tea', pick: 'aside', sure: 0.855 })
+  expect(readVerdict('aside 0.5%: a question about tea').sure, 'a percent sign says it is a percent').toBe(0.005)
+  expect(readVerdict('aside 1: a question about tea').sure, 'with no point, 0 to 100').toBe(0.01)
+})
+
+test("Jev's confidence stands in for a missing probability, and an answer with neither is a failure", () => {
+  const reply = (belongs: Record<string, unknown>): string => JSON.stringify({ answers: { belongs: { type: 'choice', ...belongs } } })
+  const unsure = { verdict: 'same', reason: '', failure: "Jev's answer did not say how sure it was" }
+
+  expect(readJev(reply({ choice: 'aside', confidence: 0.75 }))).toEqual({ verdict: 'aside', reason: '', pick: 'aside', sure: 0.75 })
+  expect(readJev(reply({ choice: 'aside', probabilities: { aside: 1.5 }, confidence: 0.75 })).sure, 'a probability past 1 is no probability').toBe(0.75)
+  expect(readJev(reply({ choice: 'aside' }))).toEqual(unsure)
+  expect(readJev(reply({ choice: 'aside', probabilities: { aside: '0.9' } }))).toEqual(unsure)
+})
+
+test('an empty TYPESAFE_API_KEY is no key', async ($, on) => {
+  const w = worldOf(on)
+  mock.clock(on, { now: 1_000 })
+  w.env = { TYPESAFE_API_KEY: '' }
+
+  await $.session.start(SESSION)
+  expect(JSON.stringify(await runCommand($, 'jev'))).toContain('Jev needs `TYPESAFE_API_KEY` set to a key')
+  await say($, 'write a parser for the config file')
+  await say($, 'now add a test for it')
+
+  expect(w.fetched).toEqual([])
+  expect(w.briefings.length, 'Claude Haiku still judges').toBe(1)
+})
+
+test('a long prompt typed again is a retry', () => {
+  const long = `rewrite the parser so that ${'every line of the config file is read once, '.repeat(12)}and nothing else`
+  const log = remember(EMPTY, beatOf('you', long))
+
+  expect(long.length).toBeGreaterThan(400)
+  expect(isWorthJudging(long, log)).toBe(false)
+  expect(isWorthJudging(`now ${long}`, log), 'one that differs within its first 400 characters is new').toBe(true)
+  expect(isWorthJudging(`${long} too`, log), 'one that differs only past them is taken for a retry').toBe(false)
+})
+
+test('a project is marked in use at each write, and at least hourly while prompts come in', async ($, on) => {
+  const w = worldOf(on)
+  const clock = mock.clock(on, { now: 1_000 })
+  const HOUR = 60 * 60 * 1000
+  w.verdicts = ['aside 90: Peru\nThe session is writing a parser; the prompt asks about Peru.', 'same: the parser']
+  w.answers = [NOT_ASIDE]
+  const used = (): number | undefined => (w.store.sizes as { projects: Record<string, { at: number }> }).projects['C:/repo']?.at
+
+  await $.session.start(SESSION)
+  expect(used()).toBe(1_000)
+
+  await say($, 'write a parser for the config file')
+  await clock.advance(10_000)
+  await say($, 'what is the capital of Peru?')
+  expect(used(), 'the label it wrote').toBe(11_000)
+
+  await clock.advance(HOUR)
+  await say($, 'now add a test for the parser')
+  expect(used(), 'nothing written, but an hour on').toBe(11_000 + HOUR)
+})
 test("the judge is reminded of the session's first prompt once the record lets go of it", async ($, on) => {
   const w = worldOf(on)
   mock.clock(on, { now: 1_000 })

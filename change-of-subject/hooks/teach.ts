@@ -1,10 +1,10 @@
-import type { Beat, Example, Judge, Judgement, Lessons, Teaching, Verdict } from '../types'
-import { MEANINGS, VERDICTS, bearsOut, briefing, clip, comparisonOf, isMistake, percent, reasonOf, spokenOf, squash } from './model'
+import type { Beat, Calibration, Example, Interrupting, Judge, Judgment, Lessons, Tally, Teaching, Verdict } from '../types'
+import { MEANINGS, VERDICTS, briefing, clip, comparisonOf, isMistake, percent, reasonOf, spokenOf, squash } from './model'
 
 type Judging = Exclude<Judge, 'off'>
 
-/** The verdicts that interrupt, and how sure the judge must be of each to do it. */
-export type Bars = Record<Exclude<Verdict, 'same'>, number>
+/** How sure the judge must be of each verdict that interrupts to do it. */
+export type Bars = Record<Interrupting, number>
 
 /** Pinned: Jev's minor versions have changed its question types before. */
 export const JEV_MODEL = 'jev-1.13.0'
@@ -15,55 +15,117 @@ export const UNTAUGHT: Teaching = { anchor: null, examples: [], lessons: [] }
 const MEANING_LINES = VERDICTS.map(v => `${v} — ${MEANINGS[v]}`)
 
 /**
- * How sure each judge must be of `aside` or `phase` to interrupt, until the labels say
+ * How sure each judge must be of `aside` or `phase` to interrupt, until its tally says
  * otherwise. Claude Haiku said nothing of how sure it was before, so it starts with no bar;
  * Jev's close calls carry on.
  */
 export const DEFAULT_SURE: Record<Judging, number> = { haiku: 0, jev: 0.7 }
 
-/** How many of a judge's calls of one verdict a scope needs before its labels set the bar. */
 const CALLS_TO_CALIBRATE = 20
 /** How many calls at or above a bar it takes to trust what they say about it. */
 const CALLS_ABOVE = 5
-/** How often a call that interrupts must be right. */
 const PRECISION = 0.8
 /** However often a judge has been wrong, a call this sure still interrupts. */
 const HIGHEST_BAR = 0.95
+const STEPS = 20
+/** Past this many calls a tally shrinks in proportion before each new one, so newer calls count for more. */
+const CALLS_REMEMBERED = 100
+/** How many answers from a range `was` reopened it takes for the tally to decide that range again. */
+export const REOPENED_ANSWERS = 5
 
-/**
- * The lowest bar at which a judge's calls of `verdict` are right often enough, by one
- * scope's labels; undefined while they are too few to say. Calls the person never answered
- * are not labels, so the bar can only be raised from the calls that interrupted, or
- * lowered by the ones `was` put right.
- */
-export function calibrated(examples: Example[], by: Judging, verdict: Verdict): number | undefined {
-  const calls = examples.flatMap(x => {
-    if (x.judge !== by || x.pick !== verdict || x.sure === undefined) return []
-    const isRight = bearsOut(x.truth, verdict)
+export const stepOf = (sure: number): number => Math.min(STEPS - 1, Math.max(0, Math.floor(sure * STEPS)))
 
-    return isRight === undefined ? [] : [{ sure: x.sure, isRight }]
-  })
-  if (calls.length < CALLS_TO_CALIBRATE) return undefined
+const sum = (counts: readonly number[]): number => counts.reduce((t, n) => t + n, 0)
 
-  const bars = [...new Set(calls.map(c => c.sure))].sort((a, b) => a - b)
-  for (const bar of bars) {
-    const above = calls.filter(c => c.sure >= bar)
-    if (above.length < CALLS_ABOVE || bar > HIGHEST_BAR) break
-    if (above.filter(c => c.isRight).length / above.length >= PRECISION) return bar
+const added = (counts: readonly number[], step: number, n: number): number[] => counts.map((c, i) => (i === step ? c + n : c))
+
+const emptyTally = (): Tally => ({ right: Array<number>(STEPS).fill(0), wrong: Array<number>(STEPS).fill(0) })
+
+/** The lowest bar at which a judge's calls of one verdict are right often enough, by one tally; undefined while it is too thin to say. */
+export function calibrated(t: Tally | undefined): number | undefined {
+  if (t === undefined) return undefined
+  const calls = t.right.map((n, i) => n + (t.wrong[i] ?? 0))
+  if (sum(calls) < CALLS_TO_CALIBRATE) return undefined
+
+  for (let step = 0; step < STEPS; step += 1) {
+    if ((calls[step] ?? 0) === 0) continue
+    const bar = step / STEPS
+    const above = sum(calls.slice(step))
+    if (above < CALLS_ABOVE || bar > HIGHEST_BAR) break
+    if (sum(t.right.slice(step)) / above >= PRECISION) return bar
   }
 
   return HIGHEST_BAR
 }
 
-/** The bar for each verdict: from the first scope with labels enough to say, else the judge's default. */
-export function barsFor(scopes: Example[][], by: Judging): Bars {
-  const bar = (v: Verdict): number => scopes.map(s => calibrated(s, by, v)).find(b => b !== undefined) ?? DEFAULT_SURE[by]
+/**
+ * The bar for each verdict: from the first scope whose tally can say, else the judge's
+ * default, and never above a range `was` reopened in either scope.
+ */
+export function barsFor(scopes: Calibration[], by: Judging): Bars {
+  const bar = (v: Interrupting): number =>
+    Math.min(
+      scopes.map(c => calibrated(c[v])).find(b => b !== undefined) ?? DEFAULT_SURE[by],
+      ...scopes.flatMap(c => c[v]?.reopened?.from ?? []),
+    )
 
   return { aside: bar('aside'), phase: bar('phase') }
 }
 
+/**
+ * A scope's tallies after a pop-up answer on a call `sure` of `verdict`: counted when its
+ * label is kept in this scope, and one answer fewer awaited where `was` reopened the range.
+ */
+export function answeredIn(c: Calibration, verdict: Interrupting, sure: number, isRight: boolean, isCounted: boolean): Calibration {
+  const t = c[verdict]
+  const open = t?.reopened
+  const isReopened = open !== undefined && sure >= open.from && sure < open.below
+  if (!isCounted && !isReopened) return c
+
+  let { right, wrong } = t ?? emptyTally()
+  if (isCounted) {
+    const total = sum(right) + sum(wrong)
+    const shrink = total >= CALLS_REMEMBERED ? (CALLS_REMEMBERED - 1) / total : 1
+    right = added(right.map(n => n * shrink), stepOf(sure), isRight ? 1 : 0)
+    wrong = added(wrong.map(n => n * shrink), stepOf(sure), isRight ? 0 : 1)
+  }
+  const reopened = isReopened ? (open.left > 1 ? { ...open, left: open.left - 1 } : undefined) : open
+
+  return { ...c, [verdict]: { right, wrong, ...(reopened === undefined ? {} : { reopened }) } }
+}
+
+/**
+ * A scope's tallies after `was` showed the bar hid a right call `sure` of `verdict`: calls
+ * from there up to the bar interrupt again until `REOPENED_ANSWERS` of them are answered.
+ */
+export function reopenedIn(c: Calibration, verdict: Interrupting, sure: number, bar: number): Calibration {
+  if (sure >= bar) return c
+
+  const t = c[verdict] ?? emptyTally()
+  const reopened = {
+    from: Math.min(sure, t.reopened?.from ?? sure),
+    below: Math.max(bar, t.reopened?.below ?? bar),
+    left: REOPENED_ANSWERS,
+  }
+
+  return { ...c, [verdict]: { ...t, reopened } }
+}
+
+/** A scope's tallies after `was` turned a pop-up answer around: its call moves to the other count. */
+export function recountedIn(c: Calibration, verdict: Interrupting, sure: number, isRight: boolean): Calibration {
+  const t = c[verdict]
+  if (t === undefined) return c
+
+  const step = stepOf(sure)
+  const moved = Math.min(1, (isRight ? t.wrong : t.right)[step] ?? 0)
+  const right = added(t.right, step, isRight ? moved : -moved)
+  const wrong = added(t.wrong, step, isRight ? -moved : moved)
+
+  return { ...c, [verdict]: { ...t, right, wrong } }
+}
+
 /** Turns a call the judge was not sure enough of into `same`: the close calls carry on. */
-export function gate(j: Judgement, bars: Bars): Judgement {
+export function gate(j: Judgment, bars: Bars): Judgment {
   if (j.verdict === 'same' || j.sure === undefined || j.sure >= bars[j.verdict]) return j
 
   return { ...j, verdict: 'same' }
@@ -75,7 +137,6 @@ export function gate(j: Judgement, bars: Bars): Judgement {
  */
 export const teaches = (x: Example, by: Judging): boolean => !isMistake(x) || x.judge === by
 
-/** How many of the person's past calls the judge is shown. */
 const SHOWN = 4
 
 const isSameCall = (a: Example, b: Example): boolean => a.at === b.at && a.prompt === b.prompt
@@ -193,7 +254,6 @@ export function readExplanation(answer: string): { reason: string; comparison: s
   return comparison === '' ? undefined : { reason: reasonOf(reason), comparison }
 }
 
-/** How many new mistakes of a judge's in a scope call for its rules to be drawn again. */
 export const MISTAKES_PER_LESSON = 10
 /** How many of a scope's labels the rules are drawn from: mistakes first, newest first. */
 const CALLS_STUDIED = 40
@@ -220,16 +280,16 @@ export const LESSONS_SYSTEM = [
 function verdictOn(x: Example): string {
   if ('not' in x.truth) return 'turned it down'
 
-  return x.truth.is === x.said ? 'bore it out' : `said it was ${x.truth.is}`
+  return x.truth.is === (x.pick ?? x.said) ? 'bore it out' : `said it was ${x.truth.is}`
 }
 
-/** One past call as the rules are drawn from it: the judge's verdict and reason, and the person's word on them. */
+/** One past call as the rules are drawn from it: the judge's own verdict and reason, and the person's word on them. */
 const studiedCall = (x: Example): string =>
   [
     '<call>',
     `<prompt>${x.prompt}</prompt>`,
     `<comparison>${x.comparison ?? ''}</comparison>`,
-    `<judged>${x.said}</judged>`,
+    `<judged>${x.pick ?? x.said}</judged>`,
     ...(x.reason === undefined || x.reason === '' ? [] : [`<reason>${x.reason}</reason>`]),
     `<person>${verdictOn(x)}</person>`,
     '</call>',
@@ -257,12 +317,22 @@ export function readLessons(answer: string): string {
 
 export const JUDGE_NAMES: Record<Judging, string> = { haiku: 'Claude Haiku', jev: 'Jev' }
 
-/** What `/change-of-subject lessons` says of one scope for one judge: its labels, the bars they set, and its rules. */
-export function scopeReport(name: string, examples: Example[], lessons: Lessons | undefined, by: Judging): string {
+/** What `/change-of-subject lessons` says of one scope for one judge: its labels, its bars, and its rules. */
+export function scopeReport(
+  name: string,
+  examples: Example[],
+  lessons: Lessons | undefined,
+  calibration: Calibration,
+  by: Judging,
+): string {
   const mistakes = examples.filter(x => x.judge === by && isMistake(x)).length
   const waiting = examples.filter(x => x.comparison === undefined).length
-  const bar = (v: Verdict): string => {
-    const own = calibrated(examples, by, v)
+  const bar = (v: Interrupting): string => {
+    const own = calibrated(calibration[v])
+    const open = calibration[v]?.reopened
+    if (open !== undefined) {
+      return `${percent(Math.min(own ?? DEFAULT_SURE[by], open.from))} (reopened by \`was\` until ${open.left} more answer${open.left === 1 ? '' : 's'})`
+    }
 
     return own === undefined ? `${percent(DEFAULT_SURE[by])} (too few calls to say; the default)` : percent(own)
   }
