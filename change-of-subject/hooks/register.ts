@@ -1,9 +1,9 @@
+// Everything that takes `$` lives in this file, for compatibility with 2.1.295: it follows `$` only into functions
+// declared in the same file. Do not move the labels or judges back into modules that are imported.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, ModelCompleteResult, Register } from 'claude-code'
 
-import type { Beat, Call, Example, Judge, Judgement, Learning, Scope, Teaching, Truth, Verdict } from '../types'
-import { drawLessons, explainVerdict, judgeWith } from './judges'
-import { forget, keepLessons, learn, learnInto, learning, promote, readScope, relearn, unlearn, visit } from './labels'
+import type { Beat, Call, Example, Judge, Judgement, Learning, Lessons, Scope, Teaching, Truth, Verdict } from '../types'
 import {
   ASIDE_HEADER,
   ASIDE_QUESTION,
@@ -11,6 +11,7 @@ import {
   CARRY_ON_HERE,
   COMPACT_FIRST,
   EMPTY,
+  LIMITS,
   NEW_SESSION,
   NOT_ASIDE,
   NOT_PHASE,
@@ -21,11 +22,16 @@ import {
   callOf,
   clip,
   explanationOf,
+  failed,
   hasSubject,
   isWorthJudging,
+  jevRefused,
+  keep,
   messageOf,
   outcomeOf,
   promptOf,
+  readJev,
+  readVerdict,
   readWas,
   remember,
   report,
@@ -33,7 +39,22 @@ import {
   sessionOf,
   squash,
 } from './model'
-import { UNTAUGHT, barsFor, gate, isDue, pastCalls, scopeReport } from './teach'
+import {
+  EXPLAIN_SYSTEM,
+  LESSONS_SYSTEM,
+  UNTAUGHT,
+  barsFor,
+  explainBrief,
+  gate,
+  haikuRequest,
+  isDue,
+  jevRequest,
+  lessonsBrief,
+  pastCalls,
+  readExplanation,
+  readLessons,
+  scopeReport,
+} from './teach'
 import type { Bars } from './teach'
 
 type Judging = Exclude<Judge, 'off'>
@@ -473,6 +494,284 @@ async function forgotten($: EngineInterface, words: string[]): Promise<string> {
     return `Forgot every label and rule kept for ${SCOPE_NAMES[scope]}.`
   } catch (e) {
     return `The labels could not be forgotten: ${messageOf(e)}`
+  }
+}
+
+// Labels: kept here, not in their own module, for compatibility with 2.1.295.
+// Claude Code 2.1.295 follows `$` only into functions declared in this file, never across an import,
+// and these take `$`.
+
+/** What a scope keeps: its labels, and each judge's rules drawn from them. */
+type Kind = 'examples' | `lessons:${Judging}`
+
+/** A scope's labels and each judge's rules, as the store holds them. */
+type Kept = { examples: Example[]; lessons: Partial<Record<Judging, Lessons>> }
+
+/** Where new labels go, by the person's say: this project's, unless they said otherwise. */
+const LEARNING_KEY = 'learn'
+/** When each project with labels was last opened, so labels of a project long left can go. */
+const PROJECTS_KEY = 'projects'
+const STALE_MS = 90 * 24 * 60 * 60 * 1000
+
+const localKey = (root: string, kind: Kind): string => `local:${root}:${kind}`
+
+/**
+ * Where a scope's labels and rules live in the plugin's own store, under the user's Claude
+ * Code directory. A project's are keyed by its root, as Claude Code keeps a local-scope MCP
+ * server: per person and per project, and never in the working tree, where they could be
+ * committed.
+ */
+async function keyOf($: EngineInterface, scope: Scope, kind: Kind): Promise<string> {
+  return scope === 'user' ? `user:${kind}` : localKey(await $.session.root(), kind)
+}
+
+async function examplesAt($: EngineInterface, key: string): Promise<Example[]> {
+  const kept = await $.store.get(key)
+
+  return Array.isArray(kept) ? (kept as Example[]) : []
+}
+
+async function lessonsAt($: EngineInterface, key: string): Promise<Lessons | undefined> {
+  const kept = (await $.store.get(key)) as Partial<Lessons> | undefined
+
+  return typeof kept?.text === 'string' && typeof kept.upTo === 'number' ? { text: kept.text, upTo: kept.upTo } : undefined
+}
+
+/** A scope's labels and each judge's rules. */
+async function readScope($: EngineInterface, scope: Scope): Promise<Kept> {
+  const lessons: Partial<Record<Judging, Lessons>> = {}
+  for (const by of JUDGES) {
+    const drawn = await lessonsAt($, await keyOf($, scope, `lessons:${by}`))
+    if (drawn !== undefined) lessons[by] = drawn
+  }
+
+  return { examples: await examplesAt($, await keyOf($, scope, 'examples')), lessons }
+}
+
+/** Keeps a label in `scope`, trimming the scope to its limit; resolves with what the scope keeps now. */
+async function learn($: EngineInterface, scope: Scope, example: Example): Promise<Example[]> {
+  const key = await keyOf($, scope, 'examples')
+  const examples = keep([...(await examplesAt($, key)), example], LIMITS[scope])
+  await $.store.set(key, examples)
+
+  return examples
+}
+
+const isOne = (x: Example, one: Pick<Example, 'at' | 'prompt'>): boolean => x.at === one.at && x.prompt === one.prompt
+
+/** Drops the label `scope` keeps for one prompt, named by when it was typed and what it said. */
+async function unlearn($: EngineInterface, scope: Scope, one: Pick<Example, 'at' | 'prompt'>): Promise<void> {
+  const key = await keyOf($, scope, 'examples')
+
+  await $.store.set(key, (await examplesAt($, key)).filter(x => !isOne(x, one)))
+}
+
+/** Rewrites the label `scope` keeps for one prompt; resolves with what the scope keeps now. */
+async function relearn(
+  $: EngineInterface,
+  scope: Scope,
+  one: Pick<Example, 'at' | 'prompt'>,
+  change: (x: Example) => Example,
+): Promise<Example[]> {
+  const key = await keyOf($, scope, 'examples')
+  const examples = (await examplesAt($, key)).map(x => (isOne(x, one) ? change(x) : x))
+  await $.store.set(key, examples)
+
+  return examples
+}
+
+async function keepLessons($: EngineInterface, scope: Scope, by: Judging, lessons: Lessons): Promise<void> {
+  await $.store.set(await keyOf($, scope, `lessons:${by}`), lessons)
+}
+
+/** Forgets a scope's labels and every judge's rules. */
+async function forget($: EngineInterface, scope: Scope): Promise<void> {
+  await $.store.delete(await keyOf($, scope, 'examples'))
+  for (const by of JUDGES) await $.store.delete(await keyOf($, scope, `lessons:${by}`))
+}
+
+/** Copies this project's labels to every project's, leaving out any already there; resolves with how many. */
+async function promote($: EngineInterface): Promise<{ copied: number; examples: Example[] }> {
+  const key = await keyOf($, 'user', 'examples')
+  const everyone = await examplesAt($, key)
+  const fresh = (await readScope($, 'local')).examples.filter(x => !everyone.some(o => isOne(o, x)))
+  const examples = keep([...everyone, ...fresh].sort((a, b) => a.at - b.at), LIMITS.user)
+  await $.store.set(key, examples)
+
+  return { copied: fresh.length, examples }
+}
+
+async function learning($: EngineInterface): Promise<Learning> {
+  const said = await $.store.get(LEARNING_KEY)
+
+  return said === 'user' || said === 'off' ? said : 'local'
+}
+
+async function learnInto($: EngineInterface, where: Learning): Promise<void> {
+  await $.store.set(LEARNING_KEY, where)
+}
+
+/** The project a store key belongs to, or undefined for a key of every project's. */
+const rootOf = (key: string): string | undefined => /^local:(.+):(?:examples|lessons:\w+)$/.exec(key)?.[1]
+
+/**
+ * Marks this project as opened now, and lets go of the labels and rules of every project
+ * nobody has opened for `STALE_MS`: the store is one file of at most 4 MiB for them all.
+ * A project with labels from before this was kept is taken as opened now.
+ */
+async function visit($: EngineInterface): Promise<void> {
+  const now = await $.clock.now()
+  const kept = (await $.store.get(PROJECTS_KEY)) as Record<string, number> | undefined
+  const opened: Record<string, number> = { ...kept }
+  const keys = await $.store.keys()
+
+  for (const key of keys) {
+    const root = rootOf(key)
+    if (root !== undefined && opened[root] === undefined) opened[root] = now
+  }
+  for (const [root, at] of Object.entries(opened)) {
+    if (now - at <= STALE_MS) continue
+    for (const key of keys) if (rootOf(key) === root) await $.store.delete(key)
+    delete opened[root]
+  }
+  opened[await $.session.root()] = now
+
+  await $.store.set(PROJECTS_KEY, opened)
+}
+
+// Judges: kept here, not in their own module, for compatibility with 2.1.295 (see Labels above).
+
+// One cheap request per prompt worth judging; a judge that does not answer in time lets the prompt through.
+const JUDGE_TIMEOUT_MS = 15_000
+// A word, a number and a dozen words of reason, then a sentence of comparison for `aside` or `phase`.
+const JUDGE_TOKENS = 120
+// Explaining a verdict runs off a timer, never while a prompt waits, and only for a label.
+const EXPLAIN_TIMEOUT_MS = 30_000
+const EXPLAIN_TOKENS = 160
+// Jev answers in well under a second. Its wait is a race on a timer, so it stays inside the
+// hook's 10s budget however the engine counts that wait.
+const JEV_TIMEOUT_MS = 5_000
+const JEV_URL = 'https://api.typesafe.ai/v1/systemone'
+// Drawing the rules runs off a timer, never while a prompt waits, and only every few corrections.
+const LESSONS_TIMEOUT_MS = 60_000
+const LESSONS_TOKENS = 800
+
+async function judgeWithHaiku($: EngineInterface, beats: Beat[], text: string, t: Teaching): Promise<Judgement> {
+  const { system, prompt } = haikuRequest(beats, text, t)
+  let r: ModelCompleteResult
+  try {
+    r = await $.model.complete({
+      model: 'haiku',
+      system,
+      prompt,
+      maxTokens: JUDGE_TOKENS,
+      effort: 'low',
+      timeoutMs: JUDGE_TIMEOUT_MS,
+    })
+  } catch (e) {
+    return failed(`Claude Haiku could not be asked: ${messageOf(e)}`)
+  }
+
+  if (r.isAnswered) return readVerdict(r.text)
+  if (r.reason === 'api-error') {
+    return failed(`Claude Haiku's request failed: ${r.status === null ? 'no response' : `HTTP ${r.status}`} (${r.error})`)
+  }
+
+  return failed(
+    r.reason === 'empty-reply'
+      ? 'Claude Haiku answered with nothing'
+      : `Claude Haiku did not answer within ${JUDGE_TIMEOUT_MS / 1000}s`,
+  )
+}
+
+async function judgeWithJev($: EngineInterface, beats: Beat[], text: string, t: Teaching): Promise<Judgement> {
+  const key = await $.env.get('TYPESAFE_API_KEY')
+  if (key === undefined) return failed('Jev has no key: `TYPESAFE_API_KEY` is not set where Claude Code started')
+
+  const call = $.http
+    .fetch(JEV_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      body: jevRequest(beats, text, t),
+    })
+    .catch((e: unknown) => failed(`Jev could not be reached: ${messageOf(e)}`))
+  // $.http.fetch takes no timeout or signal, so the judge stops waiting instead.
+  const late = new Promise<Judgement>(resolve =>
+    $.clock.after(JEV_TIMEOUT_MS, () => resolve(failed(`Jev did not answer within ${JEV_TIMEOUT_MS / 1000}s`))),
+  )
+  const r = await Promise.race([call, late])
+  if ('verdict' in r) return r
+
+  return r.ok ? readJev(r.text) : failed(jevRefused(r.status, r.text))
+}
+
+/**
+ * Asks the judge `/change-of-subject` named, taught what the person's labels say. A call,
+ * not a table of judges: the engine holds `$` to being spelled at each call site, never
+ * read out of a value.
+ */
+function judgeWith(
+  $: EngineInterface,
+  by: Exclude<Judge, 'off'>,
+  beats: Beat[],
+  text: string,
+  t: Teaching,
+): Promise<Judgement> {
+  return by === 'jev' ? judgeWithJev($, beats, text, t) : judgeWithHaiku($, beats, text, t)
+}
+
+/**
+ * Has Claude Haiku say why a verdict was given and how the prompt compared with its
+ * session, whichever judge gave the verdict: the teaching is in its words either way.
+ * `medium`: a few requests a session, and every later judgement reads what they write.
+ * Resolves undefined when it gave no comparison or could not be asked.
+ */
+async function explainVerdict(
+  $: EngineInterface,
+  session: Beat[],
+  prompt: string,
+  verdict: Verdict,
+): Promise<{ reason: string; comparison: string } | undefined> {
+  try {
+    const r = await $.model.complete({
+      model: 'haiku',
+      system: EXPLAIN_SYSTEM,
+      prompt: explainBrief(session, prompt, verdict),
+      maxTokens: EXPLAIN_TOKENS,
+      effort: 'medium',
+      timeoutMs: EXPLAIN_TIMEOUT_MS,
+    })
+
+    return r.isAnswered ? readExplanation(r.text) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Draws one judge's rules for a scope again from its labels, with Claude Sonnet: a rare
+ * call, and one whose rules every later judgement reads, so it runs at Sonnet's own
+ * `high`. Resolves with the rules, or empty when the model gave none or could not be asked.
+ */
+async function drawLessons(
+  $: EngineInterface,
+  examples: Example[],
+  lessons: Lessons | undefined,
+  by: Exclude<Judge, 'off'>,
+): Promise<string> {
+  try {
+    const r = await $.model.complete({
+      model: 'sonnet',
+      system: LESSONS_SYSTEM,
+      prompt: lessonsBrief(examples, lessons, by),
+      maxTokens: LESSONS_TOKENS,
+      effort: 'high',
+      timeoutMs: LESSONS_TIMEOUT_MS,
+    })
+
+    return r.isAnswered ? readLessons(r.text) : ''
+  } catch {
+    return ''
   }
 }
 
