@@ -8,12 +8,15 @@ turns about something else. This mod catches both at the door.
 
 Each prompt is judged against the session it was typed into, and only two verdicts stop anything:
 
-- **Another subject.** A pop-up offers to ask it with `/btw` instead, which answers a side question without touching the
-  main conversation. Say yes and the prompt goes there; say *Continue here* and it lands as typed, as it does with *Not a
-  side trip*, which also tells the mod the judge got it wrong.
-- **A new direction or phase in the same work.** A pop-up offers a fresh session, a compaction, or carrying on here.
-  Pick one and the mod runs it, then sends your prompt again, in the session the command left behind. *Not a new phase*
-  carries on here and tells the mod the judge got it wrong.
+- **Another subject.** A pop-up offers first to ask it with `/btw` instead, which answers a side question without
+  touching the main conversation, then a fresh session or a compaction. *Not a side trip* lands it as typed and tells
+  the mod the judge got it wrong.
+- **A new direction or phase in the same work.** The same pop-up, with a fresh session and a compaction first, then
+  `/btw`. *Not a new phase* lands it as typed and tells the mod the judge got it wrong.
+
+`/btw` takes the prompt as its question. A fresh session or a compaction runs first, then the mod sends your prompt
+again, in the session the command left behind. To keep the prompt here without saying the judge was wrong, type your
+own answer in the pop-up, or dismiss it.
 
 Neither pop-up argues its case: you can see your own prompt and the session it landed in. The verdict and the judge's
 few words of reason are in `/change-of-subject` when you want them.
@@ -62,25 +65,38 @@ least 70% sure of it, until your labels set another bar.
 `off`, `on`, `haiku` and `jev` last until Claude Code exits, and a `/clear` keeps them: every time Claude Code starts,
 it starts watching, judged by Claude Haiku. The rest change what is learned, and last.
 
-## The four choices for a new phase
+## The four choices
 
 Claude Code's `/clear` *is* "start a new session with empty context; previous session stays on disk (resumable with
 `/resume`)", so **New session** and clearing the session are one button, not two. The four are:
 
 | Choice | What runs | What you keep |
 | --- | --- | --- |
+| **Ask with /btw** | `/btw` with the prompt | Everything, as it was; the prompt and its answer never enter the session. |
 | **New session** | `/clear` | Nothing in context. The session you left stays on disk, resumable with `/resume`. |
 | **Compact first** | `/compact` | A summary of the work so far, with the room back. |
-| **Continue here** | nothing | Everything, as it was. |
-| **Not a new phase** | nothing | Everything, as it was, and the judge's mistake is noted. |
+| **Not a side trip** / **Not a new phase** | nothing | Everything, as it was, and the judge's mistake is noted. |
+
+A pop-up takes at most four choices, so there is no button for keeping the prompt here with no word on the verdict:
+type your own answer, or dismiss the pop-up.
 
 ## What it learns
 
-Your answers are kept as labels, and the judge is taught from them:
+Your answers are kept as labels, and the judge is taught from them. What a choice says depends on the pop-up it was
+made in:
 
-- **Ask with /btw**, **New session** and **Compact first** bear the judge out. **Not a side trip** and **Not a new
-  phase** turn it down, and say only what the prompt was not: a prompt that is not a side trip may still start a new
-  phase. **Continue here** and a dismissed pop-up say nothing: you may agree and still want the prompt here.
+| Choice | On a side trip | On a new phase |
+| --- | --- | --- |
+| **Ask with /btw** | It was a side trip. | It was a side trip: a side question is unrelated to the work, so it is not a new phase of it. The judge's mistake. |
+| **New session** | It was a side trip. You may want more than one answer, so it gets a session of its own rather than `/btw`. | It was a new phase. |
+| **Compact first** | It was a new phase. A side trip assumes the work so far is irrelevant to it, and a compaction keeps that work. The judge's mistake. | It was a new phase. |
+| **Not a side trip** / **Not a new phase** | It was not a side trip. The judge's mistake. | It was not a new phase. The judge's mistake. |
+| An answer you type, or a dismissed pop-up | Nothing. | Nothing. |
+
+- The **Not** choices say only what the prompt was not: a prompt that is not a side trip may still start a new phase,
+  and one that is not a new phase may still be a side trip.
+- An answer you type and a dismissed pop-up say nothing, because you may agree with the judge and still want the
+  prompt here.
 - `/change-of-subject was` names what the last prompt the judge ruled on was, including one it let through without a
   pop-up.
 

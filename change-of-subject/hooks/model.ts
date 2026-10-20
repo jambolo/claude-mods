@@ -1,4 +1,4 @@
-import type { Beat, Call, Example, Judge, Judgment, Scope, Truth, Verdict, Who } from '../types'
+import type { Beat, Call, Example, Interrupting, Judge, Judgment, Scope, Truth, Verdict, Who } from '../types'
 
 /** The session record starts empty. */
 export const EMPTY: Beat[] = []
@@ -235,23 +235,35 @@ export function jevRefused(status: number, body: string): string {
 export const ASIDE_HEADER = 'Side trip'
 export const PHASE_HEADER = 'New phase'
 
-/** The answers the dialogs offer. The engine takes at most four of them. */
+/**
+ * The answers the dialogs offer. The engine takes at most four of them, so leaving the
+ * prompt here without a word on the verdict is the dialog's own Other, or a dismissal.
+ */
 export const USE_BTW = 'Ask with /btw'
 export const NEW_SESSION = 'New session'
 export const COMPACT_FIRST = 'Compact first'
-export const CARRY_ON_HERE = 'Continue here'
-/** "Continue here", and the judge was wrong: the answers that turn the verdict down. */
+/** The prompt stays here, and the judge was wrong: the answers that turn the verdict down. */
 export const NOT_ASIDE = 'Not a side trip'
 export const NOT_PHASE = 'Not a new phase'
 
+/** Both dialogs offer every way out, the verdict's own first. */
+export const ASIDE_OPTIONS = [USE_BTW, NEW_SESSION, COMPACT_FIRST, NOT_ASIDE]
+export const PHASE_OPTIONS = [NEW_SESSION, COMPACT_FIRST, USE_BTW, NOT_PHASE]
+
 /**
- * What a pop-up's answer says of the judge's verdict: that it was right, or that it was
- * not. `Continue here` says neither: the person may agree with the judge and still want
- * the prompt here. Nor does a dismissed pop-up.
+ * What a pop-up's answer says the prompt was. `/btw` says a side trip, even on a new phase:
+ * a side question is unrelated to the work, so no phase of it. A compaction says a new
+ * phase, even on a side trip: a side trip takes the work so far to be irrelevant, and a
+ * compaction keeps it. A new session bears out either verdict: a side trip may want more
+ * than `/btw`'s one answer. The denial says only what the prompt was not. An answer typed in
+ * the dialog's Other says nothing: the person may agree with the judge and still want the
+ * prompt here. Nor does a dismissed pop-up.
  */
-export function outcomeOf(choice: string): 'confirmed' | 'denied' | undefined {
-  if (choice === USE_BTW || choice === NEW_SESSION || choice === COMPACT_FIRST) return 'confirmed'
-  if (choice === NOT_ASIDE || choice === NOT_PHASE) return 'denied'
+export function truthOf(choice: string, said: Interrupting): Truth | undefined {
+  if (choice === (said === 'aside' ? NOT_ASIDE : NOT_PHASE)) return { not: said }
+  if (choice === USE_BTW) return { is: 'aside' }
+  if (choice === COMPACT_FIRST) return { is: 'phase' }
+  if (choice === NEW_SESSION) return { is: said }
 
   return undefined
 }
@@ -326,7 +338,7 @@ export function readWas(args: string): { label: Verdict; scope?: Scope } | undef
  * their own prompt and the session it landed in, and the few words of reason belong in
  * `/change-of-subject`, where they are there to be asked for rather than in the way.
  */
-export const ASIDE_QUESTION = 'This prompt looks unrelated to what this session is about. Ask it as a side question instead?'
+export const ASIDE_QUESTION = 'This prompt looks unrelated to what this session is about. Where should it run?'
 export const PHASE_QUESTION = 'This prompt starts a new direction in this session. Where should it run?'
 
 const because = (reason: string): string => (reason === '' ? '' : `: ${reason}`)

@@ -3,7 +3,6 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
 import {
-  CARRY_ON_HERE,
   COMPACT_FIRST,
   EMPTY,
   NEW_SESSION,
@@ -17,13 +16,13 @@ import {
   isWorthJudging,
   jevRefused,
   keep,
-  outcomeOf,
   readJev,
   readVerdict,
   readWas,
   remember,
   report,
   sizeOf,
+  truthOf,
 } from '../hooks/model'
 import {
   EXPLAIN_SYSTEM,
@@ -42,6 +41,9 @@ import {
   reopenedIn,
 } from '../hooks/teach'
 import type { Calibration, Example, Truth, Verdict } from '../types'
+
+// An answer typed in the dialog's Other: the prompt stays here, with no word on the verdict.
+const CARRY_ON_HERE = 'continue here anyway'
 
 const SESSION = { cwd: 'C:/repo', surface: 'terminal' as const, isInteractive: true }
 // Where the store keeps this project's labels, and everyone's.
@@ -68,6 +70,8 @@ type World = {
   answers: string[]
   briefings: string[]
   questions: string[]
+  /** The options each dialog offered, in order. */
+  options: string[][]
   commands: { command: string; args: string }[]
   /** Commands the engine will not run, by name. */
   failing: string[]
@@ -154,6 +158,7 @@ function worldOf(on: On): World {
     answers: [],
     briefings: [],
     questions: [],
+    options: [],
     commands: [],
     through: [],
     unsendable: [],
@@ -256,9 +261,10 @@ function worldOf(on: On): World {
 
   // $.ui.ask is raised as a call to the AskUserQuestion tool.
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
-    const asked = (e as unknown as { questions: { question: string }[] }).questions
+    const asked = (e as unknown as { questions: { question: string; options?: (string | { label: string })[] }[] }).questions
     const question = asked[0]?.question ?? ''
     w.questions.push(question)
+    w.options.push((asked[0]?.options ?? []).map(o => (typeof o === 'string' ? o : o.label)))
     const answer = w.answers.shift() ?? ''
     // A queued 'throw' stands for a dialog the person dismissed.
     if (answer === 'throw') throw new Error('nobody answered')
@@ -427,8 +433,9 @@ test('a prompt about another subject is handed to /btw and never enters the sess
   const answer = await say($, 'what is the capital of Peru?')
 
   expect(w.questions[0], 'the dialog asks without explaining itself').toBe(
-    'This prompt looks unrelated to what this session is about. Ask it as a side question instead?',
+    'This prompt looks unrelated to what this session is about. Where should it run?',
   )
+  expect(w.options[0], 'every way out, /btw first').toEqual([USE_BTW, NEW_SESSION, COMPACT_FIRST, NOT_ASIDE])
   expect(JSON.stringify(answer)).toContain('side question')
 
   await clock.advance(SETTLED_MS)
@@ -463,6 +470,7 @@ test('a new direction can start a new session, with the prompt sent again in it'
   const answer = await say($, 'now cut a release and publish it')
 
   expect(w.questions[0]).toContain('new direction')
+  expect(w.options[0], 'every way out, /btw after the phase options').toEqual([NEW_SESSION, COMPACT_FIRST, USE_BTW, NOT_PHASE])
   expect(JSON.stringify(answer)).toContain('new session')
 
   await clock.advance(SETTLED_MS)
@@ -539,6 +547,30 @@ test('a new direction can compact first, with the prompt sent again after it', a
 
   expect(w.commands).toEqual([{ command: 'compact', args: '' }])
   expect(w.through.at(-1)).toBe('now cut a release and publish it')
+})
+
+test("either dialog runs the other verdict's command too", async ($, on) => {
+  const w = worldOf(on)
+  const clock = mock.clock(on, { now: 1_000 })
+  w.verdicts = ['phase: the release, not the parser', 'aside: a question about Peru, not the parser']
+  w.answers = [USE_BTW, COMPACT_FIRST]
+
+  await $.session.start(SESSION)
+  await say($, 'write a parser for the config file')
+  await say($, 'now cut a release and publish it')
+  await clock.advance(SETTLED_MS)
+  await say($, 'what is the capital of Peru?')
+  await clock.advance(SETTLED_MS)
+
+  expect(w.commands).toEqual([
+    { command: 'btw', args: 'now cut a release and publish it' },
+    { command: 'compact', args: '' },
+  ])
+  expect(w.through.at(-1)).toBe('what is the capital of Peru?')
+  expect(labelsIn(w, HERE).map(gist), 'and each says the prompt was the other verdict').toEqual([
+    ['now cut a release and publish it', 'phase', { is: 'aside' }, 'dialog'],
+    ['what is the capital of Peru?', 'aside', { is: 'phase' }, 'dialog'],
+  ])
 })
 
 test('a new direction the person keeps here runs no command', async ($, on) => {
@@ -796,14 +828,20 @@ test('a key Jev refuses is told once, with the kind of error Jev named', async (
   expect(w.through.length).toBe(3)
 })
 
-test("a pop-up's answer bears the verdict out or turns it down, and Continue here says neither", () => {
-  expect(outcomeOf(USE_BTW)).toBe('confirmed')
-  expect(outcomeOf(NEW_SESSION)).toBe('confirmed')
-  expect(outcomeOf(COMPACT_FIRST)).toBe('confirmed')
-  expect(outcomeOf(NOT_ASIDE)).toBe('denied')
-  expect(outcomeOf(NOT_PHASE)).toBe('denied')
-  expect(outcomeOf(CARRY_ON_HERE)).toBe(undefined)
-  expect(outcomeOf(''), 'a dismissed pop-up').toBe(undefined)
+test("a pop-up's answer says what the prompt was or was not, and one typed in its Other says nothing", () => {
+  expect(truthOf(USE_BTW, 'aside')).toEqual({ is: 'aside' })
+  expect(truthOf(NEW_SESSION, 'aside')).toEqual({ is: 'aside' })
+  expect(truthOf(COMPACT_FIRST, 'aside'), 'a compaction keeps the work: a new phase').toEqual({ is: 'phase' })
+  expect(truthOf(NOT_ASIDE, 'aside')).toEqual({ not: 'aside' })
+  expect(truthOf(NEW_SESSION, 'phase')).toEqual({ is: 'phase' })
+  expect(truthOf(COMPACT_FIRST, 'phase')).toEqual({ is: 'phase' })
+  expect(truthOf(USE_BTW, 'phase'), 'a side question: a side trip').toEqual({ is: 'aside' })
+  expect(truthOf(NOT_PHASE, 'phase')).toEqual({ not: 'phase' })
+  expect(truthOf(NOT_PHASE, 'aside'), "the other dialog's denial").toBe(undefined)
+  expect(truthOf(CARRY_ON_HERE, 'aside')).toBe(undefined)
+  expect(truthOf('', 'phase'), 'a dismissed pop-up').toBe(undefined)
+  expect(isMistake(labeled('now cut a release', 'phase', { truth: { is: 'aside' } })), '/btw on a phase').toBe(true)
+  expect(isMistake(labeled('tell me about tea', 'aside', { truth: { is: 'phase' } })), 'a compaction on a side trip').toBe(true)
 })
 
 test('a verdict turned down says only what the prompt was not', () => {

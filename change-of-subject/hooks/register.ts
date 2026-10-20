@@ -3,19 +3,18 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelCompleteResult, Register } from 'claude-code'
 
-import type { Beat, Calibration, Call, Example, Interrupting, Judge, Judgment, Learning, Lessons, Scope, Teaching, Truth, Verdict } from '../types'
+import type { Beat, Calibration, Call, Example, Interrupting, Judge, Judgment, Learning, Lessons, Scope, Teaching, Verdict } from '../types'
 import {
   ASIDE_HEADER,
+  ASIDE_OPTIONS,
   ASIDE_QUESTION,
   BEATS,
-  CARRY_ON_HERE,
   COMPACT_FIRST,
   EMPTY,
   LIMITS,
   NEW_SESSION,
-  NOT_ASIDE,
-  NOT_PHASE,
   PHASE_HEADER,
+  PHASE_OPTIONS,
   PHASE_QUESTION,
   USE_BTW,
   bearsOut,
@@ -29,7 +28,6 @@ import {
   jevRefused,
   keep,
   messageOf,
-  outcomeOf,
   promptOf,
   readJev,
   readVerdict,
@@ -40,6 +38,7 @@ import {
   sessionOf,
   sizeOf,
   squash,
+  truthOf,
 } from './model'
 import {
   EXPLAIN_SYSTEM,
@@ -193,9 +192,7 @@ async function askAbout($: EngineInterface, j: Judgment): Promise<string> {
   try {
     return await $.ui.ask(isAside ? ASIDE_QUESTION : PHASE_QUESTION, {
       header: isAside ? ASIDE_HEADER : PHASE_HEADER,
-      options: isAside
-        ? [USE_BTW, CARRY_ON_HERE, NOT_ASIDE]
-        : [NEW_SESSION, COMPACT_FIRST, CARRY_ON_HERE, NOT_PHASE],
+      options: isAside ? ASIDE_OPTIONS : PHASE_OPTIONS,
     })
   } catch {
     // A dismissed dialog is a person saying: leave my prompt where it is.
@@ -347,7 +344,7 @@ async function hear($: EngineInterface, by: Judging, beats: Beat[], text: string
 
 /**
  * Keeps a judged prompt as the ruling `was` corrects and, when the person's answer to the
- * pop-up bore the verdict out or turned it down, as a label: with Claude Haiku's comparison
+ * pop-up said what the prompt was or was not, as a label: with Claude Haiku's comparison
  * when it judged, else with the session, for Claude Haiku to explain. The answer is also
  * counted in its judge's tally.
  */
@@ -357,16 +354,15 @@ async function learnFromPrompt($: EngineInterface, by: Judging, text: string, be
 
   try {
     const into = await learning($)
-    const outcome = outcomeOf(choice)
+    const truth = said === 'same' ? undefined : truthOf(choice, said)
     const at = await $.clock.now()
     const prompt = promptOf(text)
     const session = sessionOf(beats, await read($, anchor))
-    const scope = outcome === undefined || into === 'off' ? null : into
+    const scope = truth === undefined || into === 'off' ? null : into
     await update($, ruling, () => ({ ...call, at, prompt, said, judge: by, session, scope }))
-    if (outcome === undefined || said === 'same') return
+    if (truth === undefined || said === 'same') return
 
     if (scope !== null) {
-      const truth: Truth = outcome === 'confirmed' ? { is: said } : { not: said }
       await teach($, scope, {
         ...call,
         at,
@@ -378,7 +374,7 @@ async function learnFromPrompt($: EngineInterface, by: Judging, text: string, be
         ...(call.comparison === undefined ? { session } : {}),
       })
     }
-    if (call.sure !== undefined) await countAnswer($, scope, by, said, call.sure, outcome === 'confirmed')
+    if (call.sure !== undefined) await countAnswer($, scope, by, said, call.sure, bearsOut(truth, said) === true)
   } catch {
     // A label nobody can keep costs a lesson, never the prompt.
   }
